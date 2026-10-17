@@ -113,7 +113,9 @@ public enum ArchiveExtractor {
         switch backend {
         case .libarchive:
             do {
-                try await Tools.run(tarTool, ["-x", "--no-same-owner", "-f", archive.path, "-C", staging.path])
+                // No xattrs/mac metadata from the archive: it must not set (or clear) its own quarantine.
+                try await Tools.run(tarTool, ["-x", "--no-same-owner", "--no-xattrs", "--no-mac-metadata",
+                                              "-f", archive.path, "-C", staging.path])
             } catch ToolError.failed(_, _, let stderr) {
                 if stderr.contains("through symlink") { throw ArchiveError.linkEscapes(firstLine(stderr)) }
                 throw ArchiveError.unreadable(lastLines(stderr))
@@ -121,12 +123,14 @@ public enum ArchiveExtractor {
         case .gunzip:
             let file = staging.appendingPathComponent(base)
             try await runToFile(gunzip, ["-c", archive.path], output: file)
+            propagateQuarantine(from: archive, to: file)
             let target = FileActions.uniqueURL(named: base, in: parent, fileManager: fm)
             try fm.moveItem(at: file, to: target)
             return target
         }
 
         try verifyContained(staging, fileManager: fm)
+        propagateQuarantine(from: archive, to: staging)
 
         // Finder zips carry an __MACOSX folder of AppleDouble files; it's not content.
         try? fm.removeItem(at: staging.appendingPathComponent("__MACOSX"))
@@ -165,6 +169,25 @@ public enum ArchiveExtractor {
         } catch ToolError.failed(_, _, let stderr) {
             if stderr.localizedCaseInsensitiveContains("empty") { throw ArchiveError.empty }
             throw ArchiveError.unreadable(lastLines(stderr))
+        }
+    }
+
+    static let quarantineName = "com.apple.quarantine"
+
+    /// Like Archive Utility and ditto: everything extracted from a downloaded (quarantined)
+    /// archive gets the archive's quarantine flag, so Gatekeeper still checks apps inside it.
+    static func propagateQuarantine(from archive: URL, to root: URL) {
+        let size = getxattr(archive.path, quarantineName, nil, 0, 0, 0)
+        guard size > 0 else { return }
+        var value = [UInt8](repeating: 0, count: size)
+        guard getxattr(archive.path, quarantineName, &value, size, 0, 0) == size else { return }
+        func apply(_ path: String) {
+            _ = setxattr(path, quarantineName, value, size, 0, XATTR_NOFOLLOW)
+        }
+        apply(root.path)
+        guard let walker = FileManager.default.enumerator(atPath: root.path) else { return }
+        while let relative = walker.nextObject() as? String {
+            apply((root.path as NSString).appendingPathComponent(relative))
         }
     }
 

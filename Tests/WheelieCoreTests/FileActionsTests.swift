@@ -202,6 +202,28 @@ final class FileActionsTests: XCTestCase {
         }
     }
 
+    func testQuarantineIsPropagatedAndArchiveXattrsIgnored() async throws {
+        let dir = try makeTempDir()
+        let src = dir.appendingPathComponent("src", isDirectory: true)
+        try FileManager.default.createDirectory(at: src.appendingPathComponent("App"), withIntermediateDirectories: true)
+        let inner = src.appendingPathComponent("App/run.sh")
+        try Data("echo hi".utf8).write(to: inner)
+        // An xattr stored inside the archive must not be restored.
+        try await Tools.run("/usr/bin/xattr", ["-w", "com.example.planted", "1", inner.path])
+        let zip = dir.appendingPathComponent("download.zip")
+        try await Tools.run("/usr/bin/tar", ["--format", "zip", "-c", "-f", zip.path, "-C", src.path, "App"])
+        let flag = "0083;00000000;Safari;"
+        try await Tools.run("/usr/bin/xattr", ["-w", "com.apple.quarantine", flag, zip.path])
+
+        let out = try await ArchiveExtractor.extract(zip, to: dir)
+        for path in [out.path, out.appendingPathComponent("App").path, out.appendingPathComponent("App/run.sh").path] {
+            let value = try await Tools.capture("/usr/bin/xattr", ["-p", "com.apple.quarantine", path]).stdout
+            XCTAssertEqual(value.trimmingCharacters(in: .whitespacesAndNewlines), flag, path)
+        }
+        let names = try await Tools.capture("/usr/bin/xattr", [out.appendingPathComponent("App/run.sh").path]).stdout
+        XCTAssertFalse(names.contains("com.example.planted"))
+    }
+
     func testExtract7z() async throws {
         let dir = try makeTempDir()
         let src = dir.appendingPathComponent("src", isDirectory: true)
