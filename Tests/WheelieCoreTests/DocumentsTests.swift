@@ -471,6 +471,11 @@ final class ImageFormatTests: XCTestCase {
         XCTAssertGreaterThan(try fileSize(mp4), 0)
         let probe = try await Tools.capture("ffprobe", ["-v", "error", "-show_entries", "stream=width,height", "-of", "csv=p=0", mp4.path])
         XCTAssertEqual(probe.stdout.trimmingCharacters(in: .whitespacesAndNewlines), "32,20")
+
+        if Tools.locate("gif2webp") != nil {
+            let webp = try await Converter.convert(gif, to: .webp)[0]
+            XCTAssertEqual(CGImageSourceCreateWithURL(webp as CFURL, nil).map(CGImageSourceGetCount), 3, "animation kept")
+        }
     }
 }
 
