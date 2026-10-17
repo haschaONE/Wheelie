@@ -153,7 +153,7 @@ final class FloatManager {
 enum FloatSettings {
     /// "existing" (default): the wheel's Float item adds to the most recent Float on that screen.
     /// "new": it always opens a new Float.
-    static let wheelBehaviorKey = "floatWheelBehavior"
+    static let wheelBehaviorKey = SettingsKey.floatWheelBehavior
 
     static var addsToExistingFloat: Bool {
         UserDefaults.standard.string(forKey: wheelBehaviorKey) != "new"

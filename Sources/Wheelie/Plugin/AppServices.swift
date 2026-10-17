@@ -24,6 +24,7 @@ enum SettingsKey {
     static let addResultsToFloat = "addResultsToFloat"  // Bool, default false
     static let revealResults = "revealResults"          // Bool, default false
     static let terminalApp = "terminalApp"              // bundle id, default "com.apple.Terminal"
+    static let floatWheelBehavior = "floatWheelBehavior" // "existing" | "new", default "existing"
 }
 
 struct HistoryRecord: Identifiable {

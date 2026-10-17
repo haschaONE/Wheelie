@@ -114,6 +114,7 @@ private struct OutputSettingsTab: View {
     @AppStorage(SettingsKey.customOutputFolder) private var customFolder = ""
     @AppStorage(SettingsKey.revealResults) private var revealResults = false
     @AppStorage(SettingsKey.addResultsToFloat) private var addResultsToFloat = false
+    @AppStorage(SettingsKey.floatWheelBehavior) private var floatWheelBehavior = "existing"
 
     private var location: OutputLocation { OutputLocation(setting: outputLocation) }
 
@@ -157,6 +158,10 @@ private struct OutputSettingsTab: View {
             Section("After saving") {
                 Toggle("Reveal results in Finder", isOn: $revealResults)
                 Toggle("Add results to a Float", isOn: $addResultsToFloat)
+                Picker("Float on the wheel", selection: $floatWheelBehavior) {
+                    Text("Add Files to an Existing Float").tag("existing")
+                    Text("Create a New Float").tag("new")
+                }
                 Text("A Float is a small shelf that keeps new files handy, so you can drag them on to Mail, Messages or the web.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -168,6 +173,7 @@ private struct OutputSettingsTab: View {
         .onChange(of: customFolder) { settingsChanged() }
         .onChange(of: revealResults) { settingsChanged() }
         .onChange(of: addResultsToFloat) { settingsChanged() }
+        .onChange(of: floatWheelBehavior) { settingsChanged() }
     }
 
     /// Picking "In a folder…" without a folder asks for one; cancelling keeps the old choice.
