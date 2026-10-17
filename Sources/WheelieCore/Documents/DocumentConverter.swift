@@ -69,7 +69,7 @@ enum DocumentConverter {
             let rich = try cocoaRead(source, type: .rtf)
             return Loaded(model: AttributedReader.read(rich), attributed: rich)
         case "rtfd":
-            let rich = try cocoaRead(source, type: .rtfd)
+            let rich = CocoaText.sanitized(try CocoaText.readRTFD(source))
             return Loaded(model: AttributedReader.read(rich), attributed: rich)
         case "odt":
             let rich = try cocoaRead(source, type: .openDocument)
@@ -79,9 +79,12 @@ enum DocumentConverter {
         }
     }
 
+    /// Reads from bytes, not the URL, so the reader has no folder to resolve references against;
+    /// unsafe links and non-file attachments are removed before anything else sees the text.
     static func cocoaRead(_ url: URL, type: NSAttributedString.DocumentType) throws -> NSAttributedString {
         do {
-            return try NSAttributedString(url: url, options: [.documentType: type], documentAttributes: nil)
+            let data = try Data(contentsOf: url)
+            return CocoaText.sanitized(try NSAttributedString(data: data, options: [.documentType: type], documentAttributes: nil))
         } catch {
             throw ConversionError.unreadable(url)
         }
@@ -146,7 +149,9 @@ enum DocumentConverter {
         copy.enumerateAttribute(.attachment, in: NSRange(location: 0, length: copy.length)) { value, range, _ in
             guard let attachment = value as? NSTextAttachment else { return }
             let cell = attachment.attachmentCell as? NSTextAttachmentCell
-            guard let image = cell?.image ?? attachment.image ?? attachment.fileWrapper?.regularFileContents.flatMap(NSImage.init(data:)) else { return }
+            if let wrapper = attachment.fileWrapper, !wrapper.isRegularFile { return }
+            let fileImage = attachment.fileWrapper?.regularFileContents.flatMap(NSImage.init(data:))
+            guard let image = cell?.image ?? attachment.image ?? fileImage else { return }
             guard image.size.width > maxSize.width || image.size.height > maxSize.height, image.size.width > 0, image.size.height > 0 else { return }
             let scale = min(maxSize.width / image.size.width, maxSize.height / image.size.height)
             let scaled = image.copy() as! NSImage

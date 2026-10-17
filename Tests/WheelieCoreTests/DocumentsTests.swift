@@ -510,9 +510,306 @@ final class ZipTests: XCTestCase {
     }
 }
 
+// MARK: - Security
+
+final class DocumentSecurityTests: XCTestCase {
+    // 1. Decompression bombs
+
+    /// One deflated entry whose headers claim `declaredSize` bytes (CRC unchecked by the reader).
+    private func rawZip(name: String, deflated: Data, declaredSize: UInt32) -> Data {
+        func le16(_ v: UInt16) -> [UInt8] { [UInt8(v & 0xFF), UInt8(v >> 8)] }
+        func le32(_ v: UInt32) -> [UInt8] { [UInt8(v & 0xFF), UInt8((v >> 8) & 0xFF), UInt8((v >> 16) & 0xFF), UInt8(v >> 24)] }
+        let nameBytes = Array(name.utf8)
+        var out: [UInt8] = le32(0x0403_4b50) + le16(20) + le16(0) + le16(8) + le16(0) + le16(0) + le32(0)
+        out += le32(UInt32(deflated.count)) + le32(declaredSize) + le16(UInt16(nameBytes.count)) + le16(0) + nameBytes
+        out += Array(deflated)
+        let cdOffset = UInt32(out.count)
+        var central: [UInt8] = le32(0x0201_4b50) + le16(20) + le16(20) + le16(0) + le16(8) + le16(0) + le16(0) + le32(0)
+        central += le32(UInt32(deflated.count)) + le32(declaredSize) + le16(UInt16(nameBytes.count)) + le16(0) + le16(0) + le16(0)
+        central += le16(0) + le32(0) + le32(0) + nameBytes
+        out += central
+        out += le32(0x0605_4b50) + le16(0) + le16(0) + le16(1) + le16(1) + le32(UInt32(central.count)) + le32(cdOffset) + le16(0)
+        return Data(out)
+    }
+
+    func testLyingEntrySizeIsCutOffEarly() async throws {
+        let bomb = try (Data(count: 50 * 1024 * 1024) as NSData).compressed(using: .zlib) as Data
+        XCTAssertLessThan(bomb.count, 200_000)
+        let archive = try ZipArchive(data: rawZip(name: "word/document.xml", deflated: bomb, declaredSize: 10))
+        let start = Date()
+        XCTAssertThrowsError(try archive.read("word/document.xml")) { error in
+            XCTAssertTrue(error.localizedDescription.contains("larger than its header"), error.localizedDescription)
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 0.5, "stopped after the first chunk, not after inflating 50 MB")
+
+        // The same bomb as a .docx: refused, nothing written.
+        let dir = try makeTempDir()
+        let docx = dir.appendingPathComponent("bomb.docx")
+        try rawZip(name: "word/document.xml", deflated: bomb, declaredSize: 10).write(to: docx)
+        do {
+            _ = try await Converter.convert(docx, to: .txt)
+            XCTFail("expected failure")
+        } catch {}
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("bomb.txt").path))
+    }
+
+    func testInflationBudgetCoversEveryRead() throws {
+        // Honest headers but a small budget: inflation stops at the budget, not at the end of the entry.
+        let big = try (Data(count: 8 * 1024 * 1024) as NSData).compressed(using: .zlib) as Data
+        let archive = try ZipArchive(data: rawZip(name: "big.bin", deflated: big, declaredSize: 8 * 1024 * 1024), budget: 1024 * 1024)
+        XCTAssertThrowsError(try archive.read("big.bin")) { error in
+            XCTAssertTrue(error.localizedDescription.contains("safety limit"), error.localizedDescription)
+        }
+        // Re-reading one entry (an image referenced thousands of times) draws from the same budget.
+        var writer = ZipWriter()
+        writer.add("img.bin", Data(repeating: 7, count: 1024 * 1024))
+        let repeated = try ZipArchive(data: writer.data(), budget: 3 * 1024 * 1024 + 10)
+        for _ in 0..<3 { XCTAssertEqual(try repeated.read("img.bin")?.count, 1024 * 1024) }
+        XCTAssertThrowsError(try repeated.read("img.bin"))
+    }
+
+    // 2. DTDs / entity expansion
+
+    private let lol = """
+    <!DOCTYPE lolz [<!ENTITY lol "lololololololololol"><!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">\
+    <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;"><!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">]>
+    """
+
+    private func docx(documentXML: Data) throws -> URL {
+        let url = try makeTempDir().appendingPathComponent("evil.docx")
+        var zip = ZipWriter()
+        zip.add("[Content_Types].xml", "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>")
+        zip.add("word/document.xml", documentXML)
+        try zip.write(to: url)
+        return url
+    }
+
+    private func bombDocument(padding: Int) -> String {
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!--" + String(repeating: "x", count: padding) + "-->\n" + lol
+            + "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body><w:p><w:r><w:t>&lol4;</w:t></w:r></w:p></w:body></w:document>"
+    }
+
+    private func assertRefuses(_ body: () throws -> Any, file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertThrowsError(try body(), file: file, line: line) { error in
+            let message = error.localizedDescription
+            XCTAssertTrue(message.contains("DTD") || message.contains("encoding"), message, file: file, line: line)
+        }
+    }
+
+    func testEntityBombAfterPaddingIsRefused() throws {
+        let url = try docx(documentXML: Data(bombDocument(padding: 5 * 1024).utf8))
+        assertRefuses { try DocxReader.read(url) }
+        // Control: the same document without the DTD reads fine.
+        let clean = bombDocument(padding: 5 * 1024).replacingOccurrences(of: lol, with: "").replacingOccurrences(of: "&lol4;", with: "fine")
+        let model = try DocxReader.read(try docx(documentXML: Data(clean.utf8)))
+        XCTAssertEqual(model.plainText.trimmingCharacters(in: .whitespacesAndNewlines), "fine")
+    }
+
+    func testUTF16EntityBombIsRefused() throws {
+        let text = bombDocument(padding: 10).replacingOccurrences(of: "UTF-8", with: "UTF-16")
+        var withBOM = Data([0xFF, 0xFE])
+        withBOM.append(text.data(using: .utf16LittleEndian)!)
+        assertRefuses { try DocxReader.read(try self.docx(documentXML: withBOM)) }
+        assertRefuses { try DocxReader.read(try self.docx(documentXML: text.data(using: .utf16BigEndian)!)) }
+        assertRefuses { try XML.document(text.data(using: .utf16LittleEndian)!, what: "Test") }
+        // Unknown declared encodings and EBCDIC are refused outright.
+        assertRefuses { try XML.document(Data("<?xml version=\"1.0\" encoding=\"UTF-7\"?><a/>".utf8), what: "Test") }
+        assertRefuses { try XML.document(Data([0x4C, 0x6F, 0xA7, 0x94, 0x93]), what: "Test") }
+    }
+
+    func testDTDsRefusedInSpreadsheetsAndEPUB() throws {
+        let dir = try makeTempDir()
+        // XLSX shared strings with a late DTD.
+        let xlsx = dir.appendingPathComponent("evil.xlsx")
+        var zip = ZipWriter()
+        zip.add("xl/workbook.xml", "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheets><sheet name=\"S\" sheetId=\"1\"/></sheets></workbook>")
+        zip.add("xl/sharedStrings.xml", "<!--" + String(repeating: "p", count: 6000) + "-->" + lol + "<sst><si><t>&lol4;</t></si></sst>")
+        try zip.write(to: xlsx)
+        assertRefuses { try XLSX.read(xlsx) }
+
+        // EPUB chapter with an internal subset after padding.
+        let epub = dir.appendingPathComponent("evil.epub")
+        try makeEPUB(at: epub)
+        let original = try ZipArchive(url: epub)
+        var rebuilt = ZipWriter()
+        for name in original.names {
+            var data = try original.read(name)!
+            if name.hasSuffix("ch2.xhtml") {
+                data = Data(("<!--" + String(repeating: "q", count: 6000) + "-->" + lol.replacingOccurrences(of: "lolz", with: "html")
+                             + "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>&lol4;</p></body></html>").utf8)
+            }
+            rebuilt.add(name, data, compress: name != "mimetype")
+        }
+        try rebuilt.write(to: epub)
+        assertRefuses { try EPUBReader.read(epub) }
+        // Package XML may not have any DOCTYPE at all.
+        assertRefuses { try XML.document(Data("<!DOCTYPE container><container/>".utf8), what: "Test") }
+
+        // HTML with an internal subset is refused; a plain HTML5 doctype is fine.
+        let html = dir.appendingPathComponent("evil.html")
+        try "<!DOCTYPE html [<!ENTITY x \"y\">]><html><body><p>&x;</p></body></html>".write(to: html, atomically: true, encoding: .utf8)
+        assertRefuses { try HTMLReader.read(html) }
+        try "<!DOCTYPE html><html><body><p>ok</p></body></html>".write(to: html, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try HTMLReader.read(html).plainText.trimmingCharacters(in: .whitespacesAndNewlines), "ok")
+    }
+
+    // 3. Link schemes
+
+    func testUnsafeLinksNeverReachOutputs() async throws {
+        let dir = try makeTempDir()
+        let html = dir.appendingPathComponent("links.html")
+        try """
+        <html><body><p><a href="javascript:alert(1)">evil</a> <a href="JaVaScRiPt:alert(2)">caps</a>
+        <a href="file:///etc/passwd">local</a> <a href="data:text/html,hi">data</a> <a href=" javascript:alert(3)">space</a>
+        <a href="https://safe.example/ok">safe</a> <a href="#top">anchor</a></p></body></html>
+        """.write(to: html, atomically: true, encoding: .utf8)
+        let md = dir.appendingPathComponent("links.md")
+        try "[evil](javascript:alert(1)) [local](file:///etc/passwd) [rel](../../etc/passwd) <javascript:alert(4)> [safe](https://safe.example/ok)\n"
+            .write(to: md, atomically: true, encoding: .utf8)
+        let docx = dir.appendingPathComponent("links.docx")
+        var zip = ZipWriter()
+        zip.add("word/_rels/document.xml.rels", """
+        <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">\
+        <Relationship Id="r1" Type="x/hyperlink" Target="javascript:alert(1)" TargetMode="External"/>\
+        <Relationship Id="r2" Type="x/hyperlink" Target="file:///etc/passwd" TargetMode="External"/>\
+        <Relationship Id="r3" Type="x/hyperlink" Target="https://safe.example/ok" TargetMode="External"/></Relationships>
+        """)
+        zip.add("word/document.xml", """
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" \
+        xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body><w:p>\
+        <w:hyperlink r:id="r1"><w:r><w:t>evil</w:t></w:r></w:hyperlink><w:r><w:t xml:space="preserve"> </w:t></w:r>\
+        <w:hyperlink r:id="r2"><w:r><w:t>local</w:t></w:r></w:hyperlink><w:r><w:t xml:space="preserve"> </w:t></w:r>\
+        <w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>HYPERLINK "javascript:alert(5)"</w:instrText></w:r>\
+        <w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>field</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>\
+        <w:r><w:t xml:space="preserve"> </w:t></w:r><w:hyperlink r:id="r3"><w:r><w:t>safe</w:t></w:r></w:hyperlink></w:p></w:body></w:document>
+        """)
+        try zip.write(to: docx)
+        let rtf = dir.appendingPathComponent("links.rtf")
+        let rich = NSMutableAttributedString(string: "evil ", attributes: [.link: URL(string: "javascript:alert(1)")!])
+        rich.append(NSAttributedString(string: "local ", attributes: [.link: URL(string: "file:///etc/passwd")!]))
+        rich.append(NSAttributedString(string: "safe", attributes: [.link: URL(string: "https://safe.example/ok")!]))
+        try rich.data(from: NSRange(location: 0, length: rich.length),
+                      documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]).write(to: rtf)
+
+        let checked: Set<OutputFormat> = [.html, .markdown, .docx, .pdf, .rtf, .odt]
+        for source in [html, md, docx, rtf] {
+            for format in OutputFormat.targets(for: [source]) where checked.contains(format) {
+                let out = try await Converter.convert(source, to: format)[0]
+                let label = "\(source.lastPathComponent) → \(format)"
+                let targets = try linkTargets(of: out)
+                XCTAssertTrue(targets.allSatisfy { $0.hasPrefix("https://") || $0.hasPrefix("#") }, "\(label): \(targets)")
+                if format != .odt {
+                    XCTAssertTrue(targets.contains("https://safe.example/ok"), "\(label) keeps the safe link: \(targets)")
+                }
+                let raw = try rawText(of: out).lowercased()
+                for bad in ["javascript:alert(1)", "javascript:alert(5)", "file:///etc", "data:text"] {
+                    XCTAssertFalse(raw.contains(bad), "\(label) contains \(bad)")
+                }
+                XCTAssertTrue(try readBack(out).contains("evil"), "\(label) keeps the link text")
+            }
+        }
+        XCTAssertNil(LinkPolicy.sanitize("java\tscript:alert(1)"))
+        XCTAssertNil(LinkPolicy.sanitize("vbscript:x"))
+        XCTAssertNil(LinkPolicy.sanitize("https://"))
+        XCTAssertEqual(LinkPolicy.sanitize("mailto:a@b.c"), "mailto:a@b.c")
+        XCTAssertNil(DocRun("x", link: "javascript:1").link)
+    }
+
+    /// Every link target a reader of `url` would follow.
+    private func linkTargets(of url: URL) throws -> [String] {
+        func matches(_ pattern: String, in text: String) -> [String] {
+            let regex = try! NSRegularExpression(pattern: pattern)
+            return regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).compactMap {
+                Range($0.range(at: 1), in: text).map { String(text[$0]) }
+            }
+        }
+        let text = try rawText(of: url)
+        switch url.pathExtension {
+        case "pdf":
+            let doc = try XCTUnwrap(PDFDocument(url: url))
+            return (0..<doc.pageCount).flatMap { doc.page(at: $0)!.annotations.compactMap { $0.url?.absoluteString } }
+        case "html": return matches(#"href\s*=\s*"([^"]*)""#, in: text)
+        case "md": return matches(#"(?<!!)\[[^\]]*\]\(([^)]*)\)"#, in: text)
+        case "docx": return matches(#"Target="([^"]*)" TargetMode="External""#, in: text)
+        case "rtf": return matches(#"HYPERLINK\s+"([^"]*)""#, in: text)
+        case "odt": return matches(#"xlink:href="([^"]*)""#, in: text)
+        default: return []
+        }
+    }
+
+    /// All text inside a file: the file itself, or every XML part of a zip package.
+    private func rawText(of url: URL) throws -> String {
+        if ["docx", "odt"].contains(url.pathExtension) {
+            let zip = try ZipArchive(url: url)
+            return try zip.names.filter { $0.hasSuffix(".xml") || $0.hasSuffix(".rels") }.compactMap { try zip.readString($0) }.joined()
+        }
+        return String(decoding: try Data(contentsOf: url), as: UTF8.self)
+    }
+
+    // 4. Local files pulled in by reference
+
+    func testImageReferencesStayInsideTheDocumentFolder() async throws {
+        let root = try makeTempDir()
+        let docDir = root.appendingPathComponent("doc"), secretDir = root.appendingPathComponent("secret")
+        try FileManager.default.createDirectory(at: docDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: secretDir, withIntermediateDirectories: true)
+        let secret = secretDir.appendingPathComponent("secret.png")
+        try makePNG(at: secret, size: 33, height: 17)
+        try makePNG(at: docDir.appendingPathComponent("sibling.png"), size: 20)
+        try FileManager.default.createSymbolicLink(at: docDir.appendingPathComponent("link.png"), withDestinationURL: secret)
+        try FileManager.default.createSymbolicLink(at: docDir.appendingPathComponent("sublink"), withDestinationURL: secretDir)
+        let refs = [secret.path, "file://" + secret.path, "../secret/secret.png", "%2E%2E/secret/secret.png", "link.png",
+                    "sublink/secret.png", "sibling.png"]
+
+        let html = docDir.appendingPathComponent("page.html")
+        try ("<html><body>" + refs.map { "<p>x</p><img src=\"\($0)\">" }.joined() + "</body></html>")
+            .write(to: html, atomically: true, encoding: .utf8)
+        let md = docDir.appendingPathComponent("notes.md")
+        try refs.map { "x\n\n![img](\($0))\n" }.joined(separator: "\n").write(to: md, atomically: true, encoding: .utf8)
+
+        for source in [html, md] {
+            let model = try DocumentConverter.load(source, kind: .document).model
+            let images = model.blocks.compactMap { block -> DocImage? in if case .image(let i) = block { return i } else { return nil } }
+            XCTAssertEqual(images.map { "\($0.pixelWidth)x\($0.pixelHeight)" }, ["20x20"], "\(source.lastPathComponent): only the sibling")
+            let docx = try await Converter.convert(source, to: .docx)[0]
+            XCTAssertEqual(try ZipArchive(url: docx).names.filter { $0.hasPrefix("word/media/") }.count, 1, "\(source.lastPathComponent) → DOCX")
+            let pdf = try await Converter.convert(source, to: .pdf)[0]
+            XCTAssertEqual(drawnImageSizes(pdf), ["20x20"], "\(source.lastPathComponent) → PDF")
+        }
+    }
+
+    func testRTFDWithSymlinkedAttachmentDoesNotLeakOrCrash() async throws {
+        let root = try makeTempDir()
+        let secret = root.appendingPathComponent("secret.png")
+        try makePNG(at: secret, size: 33, height: 17)
+        let rtfd = root.appendingPathComponent("doc.rtfd")
+        try FileManager.default.createDirectory(at: rtfd, withIntermediateDirectories: true)
+        try makePNG(at: rtfd.appendingPathComponent("ok.png"), size: 20)
+        try FileManager.default.createSymbolicLink(at: rtfd.appendingPathComponent("link.png"), withDestinationURL: secret)
+        try ("{\\rtf1\\ansi\\ansicpg1252 Hello {{\\NeXTGraphic link.png \\width660 \\height340}\u{00AC}} and "
+             + "{{\\NeXTGraphic ok.png \\width400 \\height400}\u{00AC}} end}")
+            .write(to: rtfd.appendingPathComponent("TXT.rtf"), atomically: true, encoding: .windowsCP1252)
+        let model = try DocumentConverter.load(rtfd, kind: .document).model
+        let images = model.blocks.compactMap { block -> DocImage? in if case .image(let i) = block { return i } else { return nil } }
+        XCTAssertEqual(images.map(\.pixelWidth), [20])
+        let docx = try await Converter.convert(rtfd, to: .docx)[0]
+        XCTAssertEqual(try ZipArchive(url: docx).names.filter { $0.hasPrefix("word/media/") }.count, 1)
+        let pdf = try await Converter.convert(rtfd, to: .pdf)[0]
+        XCTAssertTrue(PDFDocument(url: pdf)?.string?.contains("Hello") == true)
+        XCTAssertEqual(drawnImageSizes(pdf), ["20x20"], "only ok.png is drawn (the cell may paint it twice in one spot)")
+    }
+
+    /// Distinct sizes (points) of the pictures painted on every page of a PDF.
+    private func drawnImageSizes(_ url: URL) -> Set<String> {
+        guard let doc = PDFDocument(url: url) else { return [] }
+        let rects = (0..<doc.pageCount).flatMap { PDFReflow.imageRects(doc.page(at: $0)!) }
+        return Set(rects.map { "\(Int($0.width.rounded()))x\(Int($0.height.rounded()))" })
+    }
+}
+
 // MARK: - Fixtures
 
-let sampleMarkdown = """
+private let sampleMarkdown = """
 ---
 title: Front Matter Title
 ---
@@ -548,18 +845,18 @@ let x = 1
 The end.
 """
 
-func makeTempDir() throws -> URL {
+private func makeTempDir() throws -> URL {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("wheelie-docs-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
 }
 
-func fileSize(_ url: URL) throws -> Int {
+private func fileSize(_ url: URL) throws -> Int {
     try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
 }
 
 /// Text content of any output format, for assertions.
-func readBack(_ url: URL) throws -> String {
+private func readBack(_ url: URL) throws -> String {
     switch url.pathExtension.lowercased() {
     case "pdf": return PDFDocument(url: url)?.string ?? ""
     case "docx": return try NSAttributedString(url: url, options: [.documentType: NSAttributedString.DocumentType.officeOpenXML], documentAttributes: nil).string
@@ -570,7 +867,7 @@ func readBack(_ url: URL) throws -> String {
 }
 
 /// Heading (24pt bold), a paragraph with a bold word, a two-item bullet list.
-func makeRichText() -> NSAttributedString {
+private func makeRichText() -> NSAttributedString {
     let out = NSMutableAttributedString()
     out.append(NSAttributedString(string: "Quarterly Report\n", attributes: [.font: NSFont.boldSystemFont(ofSize: 24)]))
     let body: [NSAttributedString.Key: Any] = [.font: NSFont(name: "Helvetica", size: 12)!]
@@ -588,7 +885,7 @@ func makeRichText() -> NSAttributedString {
 
 /// Two-page PDF: title, heading, a long wrapped paragraph with a bold word, bullets, a picture,
 /// and a "Page N of 2" footer on each page.
-func makeTextPDF(at url: URL) throws {
+private func makeTextPDF(at url: URL) throws {
     var model = DocModel(title: "Paper")
     let long = "This paragraph is long enough to wrap across several lines of the page, so the reflow has to join "
         + "those lines back together into a single paragraph without inserting breaks, and it mentions an "
@@ -632,7 +929,7 @@ func makeTextPDF(at url: URL) throws {
 
 private func dirOf(_ url: URL) -> URL { url.deletingLastPathComponent() }
 
-func makePNG(at url: URL, size: Int, height: Int? = nil) throws {
+private func makePNG(at url: URL, size: Int, height: Int? = nil) throws {
     let h = height ?? size
     let ctx = CGContext(data: nil, width: size, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
                         bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
@@ -645,7 +942,7 @@ func makePNG(at url: URL, size: Int, height: Int? = nil) throws {
 
 /// EPUB 3 with two chapters (manifest lists chapter two first; the spine decides), an image,
 /// and a chapter that uses an HTML entity XML can't parse.
-func makeEPUB(at url: URL, encrypted: Bool = false) throws {
+private func makeEPUB(at url: URL, encrypted: Bool = false) throws {
     let dir = try makeTempDir()
     let png = dir.appendingPathComponent("pic.png")
     try makePNG(at: png, size: 24)
@@ -670,7 +967,7 @@ func makeEPUB(at url: URL, encrypted: Bool = false) throws {
     <spine><itemref idref="c1"/><itemref idref="c2"/></spine></package>
     """)
     zip.add("OEBPS/text/ch1.xhtml", """
-    <?xml version="1.0" encoding="UTF-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head>\
+    <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE html><html xmlns="http://www.w3.org/1999/xhtml"><head><title>One</title></head>\
     <body><h1>Chapter One</h1><p>Alpha paragraph with <em>emphasis</em>.</p><p><img src="../images/pic.png" alt="pic"/></p></body></html>
     """)
     zip.add("OEBPS/text/ch2.xhtml", """

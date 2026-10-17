@@ -6,10 +6,11 @@ enum MarkdownReader {
     static func read(_ url: URL) throws -> DocModel {
         guard let data = try? Data(contentsOf: url) else { throw ConversionError.unreadable(url) }
         let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
-        return try parse(text, baseURL: url.deletingLastPathComponent())
+        return try parse(text, folder: url.deletingLastPathComponent())
     }
 
-    static func parse(_ source: String, baseURL: URL? = nil) throws -> DocModel {
+    /// `folder` is where relative image references may be loaded from (see `LocalResource`).
+    static func parse(_ source: String, folder: URL? = nil) throws -> DocModel {
         guard source.count <= DocumentLimits.maxTextCharacters else {
             throw DocumentError.tooLarge("The document text exceeds the conversion limit.")
         }
@@ -19,12 +20,13 @@ enum MarkdownReader {
                                                               failurePolicy: .returnPartiallyParsedIfPossible)
         let parsed: AttributedString
         do {
-            parsed = try AttributedString(markdown: text, options: options, baseURL: baseURL)
+            // No base URL: references stay as written, so the image policy sees the original href.
+            parsed = try AttributedString(markdown: text, options: options, baseURL: nil)
         } catch {
             return DocModel.fromPlainText(source)
         }
 
-        var builder = Builder(baseURL: baseURL)
+        var builder = Builder(folder: folder)
         for run in parsed.runs {
             let runText = String(parsed[run.range].characters)
             builder.add(runText, intent: run.presentationIntent, inline: run.inlinePresentationIntent,
@@ -54,7 +56,7 @@ enum MarkdownReader {
     }
 
     private struct Builder {
-        let baseURL: URL?
+        let folder: URL?
         var blocks: [DocBlock] = []
 
         // Current block being accumulated, keyed by the innermost presentation identity.
@@ -71,7 +73,7 @@ enum MarkdownReader {
         private var rowIdentity: Int?
         private var cellIdentity: Int?
 
-        init(baseURL: URL?) { self.baseURL = baseURL }
+        init(folder: URL?) { self.folder = folder }
 
         mutating func add(_ text: String, intent: PresentationIntent?, inline: InlinePresentationIntent?,
                           link: URL?, imageURL: URL?) {
@@ -80,7 +82,7 @@ enum MarkdownReader {
 
             if inlineIntent.contains(.blockHTML) {
                 flush()
-                if let html = try? HTMLReader.parse(text, baseURL: baseURL) { blocks += html.blocks }
+                if let html = try? HTMLReader.parse(text, baseURL: folder) { blocks += html.blocks }
                 return
             }
 
@@ -196,7 +198,7 @@ enum MarkdownReader {
 
         private func loadImage(_ url: URL, alt: String) -> DocImage? {
             if url.scheme == "data" { return DataURI.image(url.absoluteString, alt: alt) }
-            guard url.isFileURL, let data = try? Data(contentsOf: url) else { return nil }
+            guard let folder, let data = LocalResource.read(url.relativeString, inside: folder) else { return nil }
             return DocImage(data: data, alt: alt)
         }
 

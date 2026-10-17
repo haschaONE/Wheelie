@@ -68,7 +68,7 @@ public enum Converter {
                 try await Tools.run("cwebp", ["-quiet", "-q", "85", "-metadata", "icc", (png ?? source).path, "-o", output.path])
             }
         case .pdf:
-            guard let image = NSImage(contentsOf: source), let page = PDFPage(image: image) else {
+            guard let data = try? Data(contentsOf: source), let image = NSImage(data: data), let page = PDFPage(image: image) else {
                 throw ConversionError.unreadable(source)
             }
             let doc = PDFDocument()
@@ -78,7 +78,9 @@ public enum Converter {
             if imageIOWrites(avifType) {
                 try writeImage(try loadImage(source), to: output, type: UTType(avifType) ?? .png, quality: 0.75)
             } else {
-                guard let encoder = ffmpegAV1Encoder else { throw ToolError.missing("ffmpeg") }
+                guard let encoder = try await ffmpegAV1Encoder() else {
+                    throw ConversionError.unsupported(.image, .avif)
+                }
                 try await withTemporaryPNG(of: source) { png in
                     try await Tools.run("ffmpeg", ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", png!.path,
                                                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", encoder, "-crf", "32",
@@ -120,24 +122,15 @@ public enum Converter {
         (CGImageDestinationCopyTypeIdentifiers() as? [String] ?? []).contains(type)
     }
 
-    /// ImageIO's AVIF encoder (macOS 15+ class systems), else an ffmpeg AV1 encoder.
-    public static let canEncodeAVIF: Bool = imageIOWrites(avifType) || ffmpegAV1Encoder != nil
+    /// ImageIO's AVIF encoder when the system has one; otherwise ffmpeg (checked for an AV1
+    /// encoder when converting, so the wheel never launches a process while it's open).
+    public static let canEncodeAVIF: Bool = imageIOWrites(avifType) || Tools.locate("ffmpeg") != nil
 
-    static let ffmpegAV1Encoder: String? = {
-        guard let ffmpeg = Tools.locate("ffmpeg") else { return nil }
-        let process = Process()
-        process.executableURL = ffmpeg
-        process.arguments = ["-hide_banner", "-encoders"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
-        process.standardInput = FileHandle.nullDevice
-        guard (try? process.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        let list = String(decoding: data, as: UTF8.self)
+    /// First AV1 encoder in `ffmpeg -encoders`, via `Tools.capture` like every other ffmpeg call.
+    static func ffmpegAV1Encoder() async throws -> String? {
+        let list = try await Tools.capture("ffmpeg", ["-hide_banner", "-encoders"]).stdout
         return ["libsvtav1", "libaom-av1", "librav1e"].first { list.contains(" \($0) ") }
-    }()
+    }
 
     static func imageCount(_ url: URL) -> Int {
         CGImageSourceCreateWithURL(url as CFURL, nil).map(CGImageSourceGetCount) ?? 0
@@ -163,8 +156,9 @@ public enum Converter {
     }
 
     /// SVG via AppKit's SVG image rep, rendered at ≥ 2x and at least 1024 px on the long side.
+    /// Loaded from bytes so there's no base folder for references (CoreSVG only renders data: images).
     static func rasterizeSVG(_ url: URL) throws -> CGImage {
-        guard let image = NSImage(contentsOf: url), image.size.width > 0, image.size.height > 0 else {
+        guard let data = try? Data(contentsOf: url), let image = NSImage(data: data), image.size.width > 0, image.size.height > 0 else {
             throw ConversionError.unreadable(url)
         }
         let longest = max(image.size.width, image.size.height)

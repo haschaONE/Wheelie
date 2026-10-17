@@ -1,7 +1,11 @@
+import Compression
 import Foundation
 
 /// Minimal in-memory ZIP reader (stored + deflate) for DOCX, XLSX and EPUB containers.
 /// Rejects encryption, ZIP64, symlinks and unsafe names, and enforces `DocumentLimits`.
+/// Entries are inflated in chunks and stop the moment they exceed their declared size, and every byte
+/// actually produced counts against one budget per archive, so a lying central directory or a
+/// document that references the same entry thousands of times can't exhaust memory.
 struct ZipArchive {
     struct Entry {
         let name: String
@@ -14,20 +18,38 @@ struct ZipArchive {
     }
 
     private let data: Data
+    private let budget: Budget
     private(set) var entries: [Entry] = []
     private var index: [String: Int] = [:]
     private var lowercasedIndex: [String: Int] = [:]
 
-    init(url: URL) throws {
+    /// Bytes this archive may still inflate, shared by every `read`.
+    final class Budget: @unchecked Sendable {
+        private let lock = NSLock()
+        private var remaining: Int
+        init(_ bytes: Int) { remaining = bytes }
+
+        func consume(_ bytes: Int) throws {
+            lock.lock()
+            defer { lock.unlock() }
+            guard bytes <= remaining else {
+                throw DocumentError.tooLarge("The archive expands beyond the safety limit.")
+            }
+            remaining -= bytes
+        }
+    }
+
+    init(url: URL, budget: Int = DocumentLimits.maxExpandedBytes) throws {
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         guard size <= DocumentLimits.maxArchiveBytes else {
             throw DocumentError.tooLarge("The archive is too large to open safely.")
         }
-        try self.init(data: Data(contentsOf: url, options: .mappedIfSafe))
+        try self.init(data: Data(contentsOf: url, options: .mappedIfSafe), budget: budget)
     }
 
-    init(data: Data) throws {
+    init(data: Data, budget: Int = DocumentLimits.maxExpandedBytes) throws {
         self.data = data
+        self.budget = Budget(budget)
         let bad = DocumentError.malformed("The ZIP container is damaged or unsupported.")
         guard data.count >= 22 else { throw bad }
 
@@ -110,19 +132,62 @@ struct ZipArchive {
         guard local + 30 <= data.count, u32(local) == 0x0403_4b50 else { throw bad }
         let start = local + 30 + Int(u16(local + 26)) + Int(u16(local + 28))
         guard start + entry.compressedSize <= data.count else { throw bad }
+        guard entry.uncompressedSize <= DocumentLimits.maxExpandedBytes else {
+            throw DocumentError.tooLarge("The archive expands beyond the safety limit.")
+        }
         let raw = data.subdata(in: data.startIndex + start ..< data.startIndex + start + entry.compressedSize)
         let output: Data
         switch entry.method {
         case 0:
+            guard entry.compressedSize == entry.uncompressedSize else { throw bad }
+            try budget.consume(raw.count)
             output = raw
         case 8:
-            if entry.uncompressedSize == 0 { return Data() }
-            guard let inflated = try? (raw as NSData).decompressed(using: .zlib) as Data else { throw bad }
-            output = inflated
+            output = try ZipArchive.inflate(raw, limit: entry.uncompressedSize, budget: budget, name: name)
         default:
             throw DocumentError.unsupported("The archive uses an unsupported compression method.")
         }
         guard output.count == entry.uncompressedSize else { throw bad }
+        return output
+    }
+
+    /// Raw-deflate decoding in 64 KB steps; throws as soon as output passes `limit` or the budget.
+    static func inflate(_ input: Data, limit: Int, budget: Budget, name: String) throws -> Data {
+        let bad = DocumentError.malformed("The archive contains a damaged file: \(name)")
+        let bomb = DocumentError.tooLarge("An archive entry is larger than its header says (\(name)).")
+        let chunk = 64 * 1024
+        let stream = UnsafeMutablePointer<compression_stream>.allocate(capacity: 1)
+        defer { stream.deallocate() }
+        guard compression_stream_init(stream, COMPRESSION_STREAM_DECODE, COMPRESSION_ZLIB) == COMPRESSION_STATUS_OK else { throw bad }
+        defer { compression_stream_destroy(stream) }
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: chunk)
+        defer { buffer.deallocate() }
+        var output = Data()
+        output.reserveCapacity(min(limit, 16 * 1024 * 1024))
+
+        try input.withUnsafeBytes { (source: UnsafeRawBufferPointer) in
+            guard let base = source.bindMemory(to: UInt8.self).baseAddress else {
+                if limit != 0 { throw bad }
+                return
+            }
+            stream.pointee.src_ptr = base
+            stream.pointee.src_size = source.count
+            while true {
+                stream.pointee.dst_ptr = buffer
+                stream.pointee.dst_size = chunk
+                let status = compression_stream_process(stream, Int32(COMPRESSION_STREAM_FINALIZE.rawValue))
+                guard status != COMPRESSION_STATUS_ERROR else { throw bad }
+                let produced = chunk - stream.pointee.dst_size
+                if output.count + produced > limit { throw bomb }
+                if produced > 0 {
+                    try budget.consume(produced)
+                    output.append(buffer, count: produced)
+                }
+                if status == COMPRESSION_STATUS_END { break }
+                // No progress with no input left: truncated stream.
+                if produced == 0 && stream.pointee.src_size == 0 { throw bad }
+            }
+        }
         return output
     }
 
@@ -237,14 +302,12 @@ private extension Data {
 // MARK: XML helpers shared by the DOCX/XLSX/EPUB readers
 
 enum XML {
-    /// Parses XML with external entities disabled; rejects entity declarations (billion laughs).
+    /// Parses package XML (OOXML parts, OPF, container.xml): any DTD is refused, external entities are
+    /// never loaded, and the parser sees exactly the text `XMLSafety` checked.
     static func document(_ data: Data, what: String) throws -> XMLDocument {
-        let head = String(decoding: data.prefix(4096), as: UTF8.self)
-        if head.range(of: "<!ENTITY", options: .caseInsensitive) != nil {
-            throw DocumentError.unsupported("\(what) entity declarations are not supported.")
-        }
+        let text = try XMLSafety.prepare(XMLSafety.decode(data, what: what), what: what, htmlDoctype: false)
         do {
-            return try XMLDocument(data: data, options: [.nodeLoadExternalEntitiesNever])
+            return try XMLDocument(data: Data(text.utf8), options: [.nodeLoadExternalEntitiesNever])
         } catch {
             throw DocumentError.malformed("\(what) contains malformed XML.")
         }
