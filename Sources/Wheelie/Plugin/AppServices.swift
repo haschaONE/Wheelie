@@ -7,7 +7,8 @@ extension Notification.Name {
     static let wheelieOutputsProduced = Notification.Name("wheelie.outputsProduced")
     /// userInfo["id"]: UUID, ["title"]: String, ["sources"]: [URL]
     static let wheelieJobStarted = Notification.Name("wheelie.jobStarted")
-    /// userInfo["id"]: UUID, ["error"]: String? (nil on success)
+    /// userInfo["id"]: UUID, ["error"]: String? (nil on success),
+    /// ["outcome"]: "outputs" | "message" | "none" (success only), ["urls"]: [URL] (outputs only)
     static let wheelieJobFinished = Notification.Name("wheelie.jobFinished")
     /// object: String? — id of the wheel item under the cursor (nil when none).
     static let wheelieHighlightChanged = Notification.Name("wheelie.highlightChanged")
@@ -65,7 +66,13 @@ final class AppServices: ObservableObject {
                 record(HistoryRecord(title: title, sources: sources, outputs: urls))
                 announce(urls)
             }
-            NotificationCenter.default.post(name: .wheelieJobFinished, object: nil, userInfo: ["id": id])
+            var info: [String: Any] = ["id": id]
+            switch outcome {
+            case .outputs(let urls): info["outcome"] = "outputs"; info["urls"] = urls
+            case .message: info["outcome"] = "message"
+            case .none: info["outcome"] = "none"
+            }
+            NotificationCenter.default.post(name: .wheelieJobFinished, object: nil, userInfo: info)
             return .success(outcome)
         } catch {
             record(HistoryRecord(title: title, sources: sources, error: error.localizedDescription))
@@ -129,14 +136,9 @@ final class AppServices: ObservableObject {
     /// Re-reads settings that affect core behaviour. Call after changing them.
     func applySettings() {
         let defaults = UserDefaults.standard
-        switch defaults.string(forKey: SettingsKey.outputLocation) ?? "original" {
-        case "downloads":
-            OutputNaming.preferredDirectory = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-        case "custom":
-            OutputNaming.preferredDirectory = defaults.string(forKey: SettingsKey.customOutputFolder).map { URL(fileURLWithPath: $0) }
-        default:
-            OutputNaming.preferredDirectory = nil
-        }
+        OutputNaming.preferredDirectory = OutputLocation(setting: defaults.string(forKey: SettingsKey.outputLocation))
+            .directory(customPath: defaults.string(forKey: SettingsKey.customOutputFolder),
+                       downloads: FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first)
     }
 
     func bool(_ key: String, default value: Bool) -> Bool {

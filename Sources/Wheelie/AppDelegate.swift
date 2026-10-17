@@ -1,6 +1,5 @@
 import AppKit
 import Combine
-import ServiceManagement
 import WheelieCore
 
 @MainActor
@@ -55,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             .sink { [weak self] _ in self?.applySettings() }
             .store(in: &observers)
 
+        installMainMenu()
         FeatureRegistry.startAll()
 
         // Debug aid: `Wheelie --show-wheel <file>...` opens the wheel immediately.
@@ -193,9 +193,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let missing = ["ffmpeg", "cwebp"].filter { Tools.locate($0) == nil }
         if !missing.isEmpty {
-            let warn = NSMenuItem(title: "Missing: \(missing.joined(separator: ", ")) — brew install \(missing.map { $0 == "cwebp" ? "webp" : $0 }.joined(separator: " "))", action: nil, keyEquivalent: "")
-            warn.isEnabled = false
-            menu.addItem(warn)
+            menu.addItem(ClosureMenuItem("⚠︎ Missing \(missing.joined(separator: ", ")) — Show Fix…") {
+                ShellFeature.showSettings(tab: .tools)
+            })
         }
 
         if !services.history.isEmpty {
@@ -217,9 +217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let toggle = item("Modifier-Drag Opens Wheel", #selector(toggleWheel))
         toggle.state = wheelEnabled ? .on : .off
         menu.addItem(toggle)
-        let login = item("Launch at Login", #selector(toggleLogin))
-        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(login)
+        ShellFeature.menuItems().forEach(menu.addItem)
         menu.addItem(.separator())
         menu.addItem(item("Quit Wheelie", #selector(NSApplication.terminate(_:)), key: "q"))
     }
@@ -239,14 +237,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         wheelEnabled.toggle()
     }
 
-    @objc private func toggleLogin() {
-        do {
-            if SMAppService.mainApp.status == .enabled { try SMAppService.mainApp.unregister() }
-            else { try SMAppService.mainApp.register() }
-        } catch {
-            let alert = NSAlert(error: error)
-            alert.messageText = "Couldn't change Launch at Login"
-            alert.runModal()
+    /// Accessory apps get no main menu, so without this ⌘C/⌘V/⌘A/⌘Z/⌘W do nothing
+    /// in editor windows. The menu bar never shows it; it only routes key equivalents.
+    private func installMainMenu() {
+        let main = NSMenu()
+        func submenu(_ title: String, _ items: [NSMenuItem]) {
+            let holder = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            let menu = NSMenu(title: title)
+            items.forEach(menu.addItem)
+            holder.submenu = menu
+            main.addItem(holder)
         }
+        func entry(_ title: String, _ action: Selector, _ key: String, _ mods: NSEvent.ModifierFlags = .command) -> NSMenuItem {
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = mods
+            return item
+        }
+        submenu("Wheelie", [
+            ClosureMenuItem("Settings…", key: ",") { ShellFeature.showSettings() },
+            entry("Hide Wheelie", #selector(NSApplication.hide(_:)), "h"),
+            entry("Quit Wheelie", #selector(NSApplication.terminate(_:)), "q"),
+        ])
+        submenu("Edit", [
+            entry("Undo", Selector(("undo:")), "z"),
+            entry("Redo", Selector(("redo:")), "z", [.command, .shift]),
+            .separator(),
+            entry("Cut", #selector(NSText.cut(_:)), "x"),
+            entry("Copy", #selector(NSText.copy(_:)), "c"),
+            entry("Paste", #selector(NSText.paste(_:)), "v"),
+            entry("Select All", #selector(NSText.selectAll(_:)), "a"),
+        ])
+        submenu("Window", [
+            entry("Close", #selector(NSWindow.performClose(_:)), "w"),
+            entry("Minimize", #selector(NSWindow.performMiniaturize(_:)), "m"),
+        ])
+        NSApp.mainMenu = main
     }
 }

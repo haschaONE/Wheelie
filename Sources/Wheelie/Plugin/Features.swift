@@ -40,7 +40,10 @@ enum FeatureRegistry {
 
     static func startAll() { features.forEach { $0.start() } }
 
-    static func menuItems() -> [NSMenuItem] { features.flatMap { $0.menuItems() } }
+    /// Tools-section items. ShellFeature's (Settings, How to Use) go in the menu footer instead.
+    static func menuItems() -> [NSMenuItem] {
+        features.filter { $0 != ShellFeature.self }.flatMap { $0.menuItems() }
+    }
 }
 
 /// NSMenuItem that runs a closure, so features don't need an @objc target.
