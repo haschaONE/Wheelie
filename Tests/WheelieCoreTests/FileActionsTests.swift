@@ -15,7 +15,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testCountPhrase() throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let a = try touch(dir, "a.txt"), b = try touch(dir, "b.txt")
         let f = try mkdir(dir, "Folder"), g = try mkdir(dir, "Other")
         XCTAssertEqual(FileActions.countPhrase([a]), "1 file")
@@ -26,7 +26,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testTerminalFolders() throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let file = try touch(dir, "a.txt"), other = try touch(dir, "b.txt")
         let folder = try mkdir(dir, "Sub")
         let app = try mkdir(dir, "Tool.app")
@@ -51,7 +51,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testUniqueNamesNeverReuseTakenPaths() throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         XCTAssertEqual(FileActions.uniqueURL(named: "photo.png", in: dir).lastPathComponent, "photo.png")
         try touch(dir, "photo.png")
         XCTAssertEqual(FileActions.uniqueURL(named: "photo.png", in: dir).lastPathComponent, "photo 2.png")
@@ -74,7 +74,7 @@ final class FileActionsTests: XCTestCase {
     // MARK: Move
 
     func testMoveRenamesOnClashAndNeverOverwrites() throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let dest = try mkdir(dir, "Dest")
         try Data("old".utf8).write(to: dest.appendingPathComponent("a.txt"))
         let a = dir.appendingPathComponent("a.txt")
@@ -92,7 +92,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testMoveRefusesDestinationInsideMovedFolder() throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let folder = try mkdir(dir, "Project")
         let sub = try mkdir(folder, "Sub")
         let file = try touch(dir, "file.txt")
@@ -112,7 +112,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testMoveValidatesDestination() throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let file = try touch(dir, "file.txt")
         let other = try touch(dir, "other.txt")
         XCTAssertThrowsError(try FileActions.move([file], to: other)) {
@@ -161,7 +161,7 @@ final class FileActionsTests: XCTestCase {
     /// Zip with `link -> <outside>` followed by `link/pwned.txt`: an extractor that writes through
     /// the link drops pwned.txt outside before any after-the-fact check can run.
     func testZipCannotWriteThroughSymlinkEntry() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let outside = dir.appendingPathComponent("outside", isDirectory: true)
         try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
         let zip = dir.appendingPathComponent("evil.zip")
@@ -185,7 +185,7 @@ final class FileActionsTests: XCTestCase {
     /// `name.tar` holding `name/link -> ../other` is fine inside staging, but once `name/` is
     /// unwrapped as the output the link would point outside it.
     func testSiblingLinkEscapingUnwrappedFolderIsRefused() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let src = dir.appendingPathComponent("src", isDirectory: true)
         let fm = FileManager.default
         try fm.createDirectory(at: src.appendingPathComponent("bundle"), withIntermediateDirectories: true)
@@ -203,7 +203,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testQuarantineIsPropagatedAndArchiveXattrsIgnored() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let src = dir.appendingPathComponent("src", isDirectory: true)
         try FileManager.default.createDirectory(at: src.appendingPathComponent("App"), withIntermediateDirectories: true)
         let inner = src.appendingPathComponent("App/run.sh")
@@ -227,7 +227,7 @@ final class FileActionsTests: XCTestCase {
     /// Read-only files and folders the owner can't even list must still get the flag
     /// (and keep their modes); otherwise an app inside could dodge Gatekeeper.
     func testQuarantineReachesLockedItems() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let tar = dir.appendingPathComponent("locked.tar")
         try await Tools.run("/usr/bin/python3", ["-I", "-c", """
         import tarfile, io, sys
@@ -269,7 +269,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testExtract7z() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let src = dir.appendingPathComponent("src", isDirectory: true)
         try FileManager.default.createDirectory(at: src, withIntermediateDirectories: true)
         try Data("seven".utf8).write(to: src.appendingPathComponent("a.txt"))
@@ -290,7 +290,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testExtractZipIntoNewFolder() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let src = try mkdir(dir, "src")
         try sampleTree(in: src)
         let out = try mkdir(dir, "out")
@@ -309,7 +309,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testExtractZipWithSingleMatchingFolderIsNotDoubleNested() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let project = try mkdir(dir, "Project")
         try sampleTree(in: project)
         let out = try mkdir(dir, "out")
@@ -324,7 +324,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testExtractTarFamily() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let src = try mkdir(dir, "src")
         try sampleTree(in: src)
         for ext in ["tar.gz", "tgz", "tar.bz2", "tar.xz", "tar"] {
@@ -340,7 +340,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testExtractToCustomDirectory() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let src = try mkdir(dir, "src")
         try sampleTree(in: src)
         let archive = dir.appendingPathComponent("pack.tgz")
@@ -352,7 +352,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testExtractSingleGzipFile() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let notes = dir.appendingPathComponent("notes.txt")
         try Data("hello gzip".utf8).write(to: notes)
         let gz = dir.appendingPathComponent("notes.txt.gz")
@@ -366,7 +366,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testRejectsZipWithTraversalEntries() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let out = try mkdir(dir, "out")
         let zip = out.appendingPathComponent("evil.zip")
         try makeStoredZip(at: zip, entries: [("ok.txt", Data("fine".utf8)), ("../escaped.txt", Data("evil".utf8))])
@@ -383,7 +383,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testRejectsTarWithTraversalOrAbsoluteEntries() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let work = try mkdir(dir, "work")
         let inner = try mkdir(work, "inner")
         try Data("evil".utf8).write(to: work.appendingPathComponent("escape.txt"))
@@ -407,7 +407,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testRejectsSymlinksPointingOutside() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         for (name, target) in [("absolute", "/etc"), ("relative", "../../outside")] {
             let src = try mkdir(dir, "src-\(name)")
             let pack = try mkdir(src, "pack")
@@ -428,7 +428,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testAllowsSymlinksInsideArchive() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let src = try mkdir(dir, "src")
         try sampleTree(in: src)
         try FileManager.default.createSymbolicLink(atPath: src.appendingPathComponent("sub/up").path,
@@ -440,7 +440,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testRejectsEmptyArchive() async throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let archive = dir.appendingPathComponent("empty.tar")
         try await Tools.run("/usr/bin/tar", ["-c", "-f", archive.path, "-T", "/dev/null"])
         do {
@@ -466,7 +466,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testDetectsQRCodesInImage() throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let png = dir.appendingPathComponent("codes.png")
         let image = try canvas(width: 520, height: 1000) { ctx in
             ctx.draw(try qrImage("https://example.com/top"), in: CGRect(x: 60, y: 560, width: 400, height: 400))
@@ -486,7 +486,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testDetectsQRCodesOnEveryPDFPage() throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let pdf = dir.appendingPathComponent("tickets.pdf")
         var box = CGRect(x: 0, y: 0, width: 612, height: 792)
         let ctx = try XCTUnwrap(CGContext(pdf as CFURL, mediaBox: &box, nil))
@@ -510,7 +510,7 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testNoCodesAndUnreadableFiles() throws {
-        let dir = try makeTempDir()
+        let dir = try fileActionsTempDir()
         let blank = dir.appendingPathComponent("blank.png")
         try writePNG(try canvas(width: 200, height: 200) { _ in }, to: blank)
         let broken = dir.appendingPathComponent("broken.jpg")
@@ -531,7 +531,7 @@ final class FileActionsTests: XCTestCase {
 
 // MARK: Helpers
 
-private func makeTempDir() throws -> URL {
+private func fileActionsTempDir() throws -> URL {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("wheelie-fileactions-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir

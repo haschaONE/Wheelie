@@ -4,12 +4,19 @@ import WheelieCore
 /// Inner ring: one petal per output format valid for the dragged files.
 enum ConvertFeature: WheelieFeature {
     static func wheelItems() -> [WheelItem] {
-        OutputFormat.allCases.enumerated().map { index, format in
-            WheelItem(id: "convert.\(format.rawValue)", label: format.label, symbol: format.symbol,
-                      ring: .inner, order: index,
-                      accepts: { OutputFormat.targets(for: $0).contains(format) },
-                      perform: { files in .outputs(try await convert(files, to: format)) })
-        }
+        OutputFormat.allCases.enumerated().map { index, format in item(format, order: index) }
+    }
+
+    /// Petals in usefulness order for these files (the order `targets(for:)` ranks them).
+    static func wheelItems(for files: [URL]) -> [WheelItem] {
+        OutputFormat.targets(for: files).enumerated().map { index, format in item(format, order: index) }
+    }
+
+    private static func item(_ format: OutputFormat, order: Int) -> WheelItem {
+        WheelItem(id: "convert.\(format.rawValue)", label: format.label, symbol: format.symbol,
+                  ring: .inner, order: order,
+                  accepts: { OutputFormat.targets(for: $0).contains(format) },
+                  perform: { files in .outputs(try await convert(files, to: format)) })
     }
 
     struct BatchError: LocalizedError {

@@ -21,6 +21,8 @@ enum VideoToolsFeature: WheelieFeature {
 }
 ```
 
+Override `wheelItems(for: files)` instead when petal order depends on the selection.
+
 `WheelItem` (`Plugin/WheelItem.swift`): `id` ("video.trim"), `label` (short, ≤ 12
 chars fits best), `symbol` (SF Symbol), `ring` (.outer for tools), `order`,
 `accepts(files)` (cheap!), `perform(files) async throws -> WheelOutcome`:
@@ -43,7 +45,8 @@ Throw an `Error` with a good `localizedDescription` on failure; the hub shows it
 
 ## Core library (`Sources/WheelieCore`) — put testable logic here
 
-- `FileKind(url:)` — .image/.video/.audio/.pdf/.unknown (Documents feature may extend).
+- `FileKind(url:)` — .image/.video/.audio/.pdf/.document/.ebook/.presentation/.spreadsheet/.unknown
+  (folders are .unknown). Use `default:` in switches; cases may be added.
 - `OutputNaming.uniqueURL(for:ext:suffix:)` — ALWAYS use for output paths: never
   overwrite, respects the "Save to" setting. E.g. `uniqueURL(for: src, ext: "mp4", suffix: " trimmed")`.
 - `Tools.run(name, args)` / `Tools.capture(name, args) -> (stdout, stderr)` — run

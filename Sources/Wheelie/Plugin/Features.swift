@@ -5,6 +5,8 @@ import AppKit
 protocol WheelieFeature {
     /// Everything this feature can put on the wheel; filtered per drag via `accepts`.
     static func wheelItems() -> [WheelItem]
+    /// Items for a specific drag; override to order petals per selection. Defaults to `wheelItems()`.
+    static func wheelItems(for files: [URL]) -> [WheelItem]
     /// Extra entries for the menu bar menu's "Tools" section.
     static func menuItems() -> [NSMenuItem]
     /// Called once at launch, after the status item exists.
@@ -13,6 +15,7 @@ protocol WheelieFeature {
 
 extension WheelieFeature {
     static func wheelItems() -> [WheelItem] { [] }
+    static func wheelItems(for files: [URL]) -> [WheelItem] { wheelItems() }
     static func menuItems() -> [NSMenuItem] { [] }
     static func start() {}
 }
@@ -33,7 +36,7 @@ enum FeatureRegistry {
     ]
 
     static func items(for files: [URL]) -> [WheelItem] {
-        features.flatMap { $0.wheelItems() }
+        features.flatMap { $0.wheelItems(for: files) }
             .filter { $0.accepts(files) }
             .sorted { ($0.ring, $0.order, $0.label) < ($1.ring, $1.order, $1.label) }
     }
