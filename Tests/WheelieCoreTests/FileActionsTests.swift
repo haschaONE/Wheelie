@@ -153,9 +153,65 @@ final class FileActionsTests: XCTestCase {
         XCTAssertTrue(ArchiveExtractor.canExtract(URL(fileURLWithPath: "/tmp/a.gz")))
         XCTAssertFalse(ArchiveExtractor.canExtract(URL(fileURLWithPath: "/tmp/a.png")))
         XCTAssertFalse(ArchiveExtractor.canExtract(URL(string: "https://example.com/a.zip")!))
-        let has7z = ["7zz", "7z", "unar"].contains { Tools.locate($0) != nil }
-        XCTAssertEqual(ArchiveExtractor.canExtract(URL(fileURLWithPath: "/tmp/a.7z")), has7z)
-        XCTAssertEqual(ArchiveExtractor.canExtract(URL(fileURLWithPath: "/tmp/a.rar")), has7z)
+        // bsdtar (libarchive) reads 7z and rar itself.
+        XCTAssertTrue(ArchiveExtractor.canExtract(URL(fileURLWithPath: "/tmp/a.7z")))
+        XCTAssertTrue(ArchiveExtractor.canExtract(URL(fileURLWithPath: "/tmp/a.rar")))
+    }
+
+    /// Zip with `link -> <outside>` followed by `link/pwned.txt`: an extractor that writes through
+    /// the link drops pwned.txt outside before any after-the-fact check can run.
+    func testZipCannotWriteThroughSymlinkEntry() async throws {
+        let dir = try makeTempDir()
+        let outside = dir.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        let zip = dir.appendingPathComponent("evil.zip")
+        try await Tools.run("/usr/bin/python3", ["-I", "-c", """
+        import zipfile, stat, sys
+        z = zipfile.ZipFile(sys.argv[1], 'w')
+        i = zipfile.ZipInfo('link'); i.create_system = 3; i.external_attr = (stat.S_IFLNK | 0o777) << 16
+        z.writestr(i, sys.argv[2])
+        z.writestr('link/pwned.txt', 'gotcha')
+        z.close()
+        """, zip.path, outside.path])
+        do {
+            _ = try await ArchiveExtractor.extract(zip, to: dir)
+            XCTFail("expected refusal")
+        } catch {
+            XCTAssertTrue(error is ArchiveError, "\(error)")
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("pwned.txt").path))
+    }
+
+    /// `name.tar` holding `name/link -> ../other` is fine inside staging, but once `name/` is
+    /// unwrapped as the output the link would point outside it.
+    func testSiblingLinkEscapingUnwrappedFolderIsRefused() async throws {
+        let dir = try makeTempDir()
+        let src = dir.appendingPathComponent("src", isDirectory: true)
+        let fm = FileManager.default
+        try fm.createDirectory(at: src.appendingPathComponent("bundle"), withIntermediateDirectories: true)
+        try fm.createSymbolicLink(atPath: src.appendingPathComponent("bundle/link").path, withDestinationPath: "../other")
+        let tar = dir.appendingPathComponent("bundle.tar")
+        try await Tools.run("/usr/bin/tar", ["-c", "-f", tar.path, "-C", src.path, "bundle"])
+        let out = dir.appendingPathComponent("out", isDirectory: true)
+        try fm.createDirectory(at: out, withIntermediateDirectories: true)
+        do {
+            _ = try await ArchiveExtractor.extract(tar, to: out)
+            XCTFail("expected refusal")
+        } catch {
+            XCTAssertEqual(error as? ArchiveError, .linkEscapes("link"))
+        }
+    }
+
+    func testExtract7z() async throws {
+        let dir = try makeTempDir()
+        let src = dir.appendingPathComponent("src", isDirectory: true)
+        try FileManager.default.createDirectory(at: src, withIntermediateDirectories: true)
+        try Data("seven".utf8).write(to: src.appendingPathComponent("a.txt"))
+        let archive = dir.appendingPathComponent("pack.7z")
+        try await Tools.run("/usr/bin/tar", ["--format", "7zip", "-c", "-f", archive.path, "-C", src.path, "a.txt"])
+        let out = try await ArchiveExtractor.extract(archive, to: dir)
+        XCTAssertEqual(out.lastPathComponent, "pack")
+        XCTAssertEqual(try String(contentsOf: out.appendingPathComponent("a.txt")), "seven")
     }
 
     func testSafeEntryPaths() {

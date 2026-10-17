@@ -41,10 +41,8 @@ public enum ArchiveError: LocalizedError, Equatable {
         switch self {
         case .unsupported(let name):
             return "“\(name)” isn't an archive Wheelie can extract."
-        case .toolMissing(.rar):
-            return "Extracting RAR archives needs unar or 7-Zip. Install one with: brew install unar"
-        case .toolMissing:
-            return "Extracting 7z archives needs 7-Zip or unar. Install one with: brew install sevenzip"
+        case .toolMissing(let format):
+            return "This Mac can't extract \(format.rawValue) archives (/usr/bin/tar is missing)."
         case .unsafeEntry(let path):
             return "The archive contains an unsafe path (“\(path)”), so it wasn't extracted."
         case .linkEscapes(let path):
@@ -59,25 +57,22 @@ public enum ArchiveError: LocalizedError, Equatable {
 
 public enum ArchiveExtractor {
     enum Backend: Equatable {
-        case ditto, tar, gunzip
-        case sevenZip(URL)
-        case unar(URL)
+        /// bsdtar (libarchive) for zip, tar*, 7z and rar: one parser both lists and extracts, and
+        /// without -P it refuses `..`, absolute paths and writing through symlinks
+        /// ("Cannot extract through symlink"). ditto, 7-Zip and unar don't all guarantee the latter.
+        case libarchive
+        case gunzip
     }
 
-    static let ditto = "/usr/bin/ditto"
     static let tarTool = "/usr/bin/tar"
     static let gunzip = "/usr/bin/gunzip"
-    static let zipinfo = "/usr/bin/zipinfo"
 
     static func backend(for format: ArchiveFormat) -> Backend? {
-        func sevenZip() -> Backend? { (Tools.locate("7zz") ?? Tools.locate("7z")).map(Backend.sevenZip) }
-        func unar() -> Backend? { Tools.locate("unar").map(Backend.unar) }
         switch format {
-        case .zip: return .ditto
-        case .tar: return .tar
-        case .gzip: return .gunzip
-        case .sevenZip: return sevenZip() ?? unar()
-        case .rar: return unar() ?? sevenZip()
+        case .gzip:
+            return FileManager.default.isExecutableFile(atPath: gunzip) ? .gunzip : nil
+        case .zip, .tar, .sevenZip, .rar:
+            return FileManager.default.isExecutableFile(atPath: tarTool) ? .libarchive : nil
         }
     }
 
@@ -116,26 +111,26 @@ public enum ArchiveExtractor {
         defer { try? fm.removeItem(at: staging) }
 
         switch backend {
-        case .ditto:
-            try await Tools.run(ditto, ["-x", "-k", archive.path, staging.path])
-        case .tar:
-            // bsdtar also refuses `..`, absolute paths and writing through symlinks by default.
-            try await Tools.run(tarTool, ["-x", "-f", archive.path, "-C", staging.path])
+        case .libarchive:
+            do {
+                try await Tools.run(tarTool, ["-x", "--no-same-owner", "-f", archive.path, "-C", staging.path])
+            } catch ToolError.failed(_, _, let stderr) {
+                if stderr.contains("through symlink") { throw ArchiveError.linkEscapes(firstLine(stderr)) }
+                throw ArchiveError.unreadable(lastLines(stderr))
+            }
         case .gunzip:
             let file = staging.appendingPathComponent(base)
             try await runToFile(gunzip, ["-c", archive.path], output: file)
             let target = FileActions.uniqueURL(named: base, in: parent, fileManager: fm)
             try fm.moveItem(at: file, to: target)
             return target
-        case .sevenZip(let tool):
-            try await Tools.run(tool.path, ["x", "-y", "-o" + staging.path, archive.path])
-        case .unar(let tool):
-            try await Tools.run(tool.path, ["-q", "-D", "-o", staging.path, archive.path])
         }
 
         try verifyContained(staging, fileManager: fm)
 
-        let ignored: Set<String> = [".DS_Store", "__MACOSX"]
+        // Finder zips carry an __MACOSX folder of AppleDouble files; it's not content.
+        try? fm.removeItem(at: staging.appendingPathComponent("__MACOSX"))
+        let ignored: Set<String> = [".DS_Store"]
         let top = try fm.contentsOfDirectory(at: staging, includingPropertiesForKeys: [.isSymbolicLinkKey])
             .filter { !ignored.contains($0.lastPathComponent) }
         guard !top.isEmpty else { throw ArchiveError.empty }
@@ -146,25 +141,19 @@ public enum ArchiveExtractor {
            (try? top[0].resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true,
            FileActions.isDirectory(top[0], fileManager: fm) {
             source = top[0]
+            // A link may stay inside staging yet point to a sibling of the folder we keep.
+            try verifyContained(source, fileManager: fm)
         }
         let target = FileActions.uniqueFolderURL(named: base, in: parent, fileManager: fm)
         try fm.moveItem(at: source, to: target)
         return target
     }
 
-    /// Lists entry names where a system tool can, and refuses unsafe or empty archives.
-    /// 7z/rar extractors sanitise paths themselves; those are checked after extraction only.
+    /// Lists entries with the same parser that extracts them and refuses unsafe or empty archives.
+    /// A listing failure refuses the archive.
     static func checkEntries(of archive: URL, backend: Backend) async throws {
-        let listing: String
-        switch backend {
-        case .ditto:
-            guard FileManager.default.isExecutableFile(atPath: zipinfo) else { return }
-            listing = try await list(zipinfo, ["-1", archive.path])
-        case .tar:
-            listing = try await list(tarTool, ["-t", "-f", archive.path])
-        case .gunzip, .sevenZip, .unar:
-            return
-        }
+        guard backend == .libarchive else { return }
+        let listing = try await list(tarTool, ["-t", "-f", archive.path])
         let entries = listing.split(whereSeparator: \.isNewline).map(String.init).filter { !$0.isEmpty }
         guard !entries.isEmpty else { throw ArchiveError.empty }
         if let bad = entries.first(where: { !isSafeEntryPath($0) }) { throw ArchiveError.unsafeEntry(bad) }
@@ -175,9 +164,16 @@ public enum ArchiveExtractor {
             return try await Tools.capture(tool, args).stdout
         } catch ToolError.failed(_, _, let stderr) {
             if stderr.localizedCaseInsensitiveContains("empty") { throw ArchiveError.empty }
-            let tail = stderr.split(whereSeparator: \.isNewline).suffix(2).joined(separator: " ")
-            throw ArchiveError.unreadable(tail)
+            throw ArchiveError.unreadable(lastLines(stderr))
         }
+    }
+
+    private static func lastLines(_ text: String) -> String {
+        text.split(whereSeparator: \.isNewline).suffix(2).joined(separator: " ")
+    }
+
+    private static func firstLine(_ text: String) -> String {
+        text.split(whereSeparator: \.isNewline).first.map(String.init) ?? text
     }
 
     /// Throws if any symlink inside `root` points (or resolves) outside it.
