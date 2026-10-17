@@ -224,6 +224,50 @@ final class FileActionsTests: XCTestCase {
         XCTAssertFalse(names.contains("com.example.planted"))
     }
 
+    /// Read-only files and folders the owner can't even list must still get the flag
+    /// (and keep their modes); otherwise an app inside could dodge Gatekeeper.
+    func testQuarantineReachesLockedItems() async throws {
+        let dir = try makeTempDir()
+        let tar = dir.appendingPathComponent("locked.tar")
+        try await Tools.run("/usr/bin/python3", ["-I", "-c", """
+        import tarfile, io, sys
+        t = tarfile.open(sys.argv[1], 'w')
+        def add(name, mode, data=None):
+            i = tarfile.TarInfo(name); i.mode = mode
+            if data is None:
+                i.type = tarfile.DIRTYPE; t.addfile(i)
+            else:
+                i.size = len(data); t.addfile(i, io.BytesIO(data))
+        add('top', 0o755)
+        add('top/sealed', 0o755)
+        add('top/sealed/run.sh', 0o444, b'echo hi')
+        add('top/readonly.txt', 0o444, b'x')
+        t.close()
+        # Lock the folder after its contents so extraction itself still works.
+        """, tar.path])
+        let flag = "0083;00000000;Safari;"
+        try await Tools.run("/usr/bin/xattr", ["-w", "com.apple.quarantine", flag, tar.path])
+        let out = try await ArchiveExtractor.extract(tar, to: dir)
+        let sealed = out.appendingPathComponent("top/sealed")
+        // Lock the folder now (no access for anyone) and run the flagging pass again on it.
+        XCTAssertEqual(chmod(sealed.path, 0o000), 0)
+        let readonly = out.appendingPathComponent("top/readonly.txt").path
+        XCTAssertEqual(chmod(readonly, 0o644), 0)
+        try await Tools.run("/usr/bin/xattr", ["-d", "com.apple.quarantine", readonly])
+        XCTAssertEqual(chmod(readonly, 0o444), 0)
+        try ArchiveExtractor.propagateQuarantine(from: tar, to: out)
+        var info = stat()
+        XCTAssertEqual(lstat(sealed.path, &info), 0)
+        XCTAssertEqual(info.st_mode & 0o7777, 0, "mode restored")
+        XCTAssertEqual(lstat(readonly, &info), 0)
+        XCTAssertEqual(info.st_mode & 0o7777, 0o444, "mode restored")
+        XCTAssertEqual(chmod(sealed.path, 0o755), 0)
+        for path in ["top/readonly.txt", "top/sealed", "top/sealed/run.sh"] {
+            let value = try await Tools.capture("/usr/bin/xattr", ["-p", "com.apple.quarantine", out.appendingPathComponent(path).path]).stdout
+            XCTAssertEqual(value.trimmingCharacters(in: .whitespacesAndNewlines), flag, path)
+        }
+    }
+
     func testExtract7z() async throws {
         let dir = try makeTempDir()
         let src = dir.appendingPathComponent("src", isDirectory: true)

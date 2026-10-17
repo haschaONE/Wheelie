@@ -36,6 +36,7 @@ public enum ArchiveError: LocalizedError, Equatable {
     case linkEscapes(String)
     case empty
     case unreadable(String)
+    case quarantineFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -51,6 +52,8 @@ public enum ArchiveError: LocalizedError, Equatable {
             return "The archive is empty."
         case .unreadable(let detail):
             return "The archive couldn't be read. \(detail)"
+        case .quarantineFailed(let path):
+            return "“\(path)” couldn't be marked as downloaded, so the archive wasn't extracted."
         }
     }
 }
@@ -123,14 +126,14 @@ public enum ArchiveExtractor {
         case .gunzip:
             let file = staging.appendingPathComponent(base)
             try await runToFile(gunzip, ["-c", archive.path], output: file)
-            propagateQuarantine(from: archive, to: file)
+            try propagateQuarantine(from: archive, to: file)
             let target = FileActions.uniqueURL(named: base, in: parent, fileManager: fm)
             try fm.moveItem(at: file, to: target)
             return target
         }
 
         try verifyContained(staging, fileManager: fm)
-        propagateQuarantine(from: archive, to: staging)
+        try propagateQuarantine(from: archive, to: staging)
 
         // Finder zips carry an __MACOSX folder of AppleDouble files; it's not content.
         try? fm.removeItem(at: staging.appendingPathComponent("__MACOSX"))
@@ -176,19 +179,48 @@ public enum ArchiveExtractor {
 
     /// Like Archive Utility and ditto: everything extracted from a downloaded (quarantined)
     /// archive gets the archive's quarantine flag, so Gatekeeper still checks apps inside it.
-    static func propagateQuarantine(from archive: URL, to root: URL) {
+    /// Fails closed: read-only items and unreadable folders are opened up just long enough to
+    /// flag (then their modes are restored); anything that still can't be flagged throws.
+    /// Symlinks are skipped — what they point to inside the tree is flagged itself.
+    static func propagateQuarantine(from archive: URL, to root: URL) throws {
         let size = getxattr(archive.path, quarantineName, nil, 0, 0, 0)
         guard size > 0 else { return }
         var value = [UInt8](repeating: 0, count: size)
-        guard getxattr(archive.path, quarantineName, &value, size, 0, 0) == size else { return }
-        func apply(_ path: String) {
-            _ = setxattr(path, quarantineName, value, size, 0, XATTR_NOFOLLOW)
+        guard getxattr(archive.path, quarantineName, &value, size, 0, 0) == size else {
+            throw ArchiveError.quarantineFailed(archive.lastPathComponent)
         }
-        apply(root.path)
-        guard let walker = FileManager.default.enumerator(atPath: root.path) else { return }
-        while let relative = walker.nextObject() as? String {
-            apply((root.path as NSString).appendingPathComponent(relative))
+        try flag(root.path, value: value, relativeTo: root.path)
+    }
+
+    private static func flag(_ path: String, value: [UInt8], relativeTo root: String) throws {
+        var info = stat()
+        guard lstat(path, &info) == 0 else { throw ArchiveError.quarantineFailed(display(path, root)) }
+        let type = info.st_mode & S_IFMT
+        if type == S_IFLNK { return }
+        let isDirectory = type == S_IFDIR
+        let originalMode = info.st_mode & 0o7777
+        // Owner needs write to set an xattr, and read+execute to list a folder.
+        let needed: mode_t = isDirectory ? 0o700 : 0o200
+        let opened = originalMode & needed != needed
+        if opened, chmod(path, originalMode | needed) != 0 { throw ArchiveError.quarantineFailed(display(path, root)) }
+        defer { if opened { _ = chmod(path, originalMode) } }
+
+        if isDirectory {
+            let children: [String]
+            do { children = try FileManager.default.contentsOfDirectory(atPath: path) }
+            catch { throw ArchiveError.quarantineFailed(display(path, root)) }
+            for child in children {
+                try flag((path as NSString).appendingPathComponent(child), value: value, relativeTo: root)
+            }
         }
+        if setxattr(path, quarantineName, value, value.count, 0, XATTR_NOFOLLOW) != 0 {
+            throw ArchiveError.quarantineFailed(display(path, root))
+        }
+    }
+
+    private static func display(_ path: String, _ root: String) -> String {
+        guard path.hasPrefix(root + "/") else { return (path as NSString).lastPathComponent }
+        return String(path.dropFirst(root.count + 1))
     }
 
     private static func lastLines(_ text: String) -> String {
