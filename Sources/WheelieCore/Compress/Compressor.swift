@@ -27,7 +27,7 @@ public enum Compressor {
         case .pdf:
             produced = try PDFCompressor.compress(source, strength: options.imageStrength, cap: cap,
                                                   targeted: target != nil, workDir: work)
-        case .unknown:
+        default:
             throw CompressionError.unsupported(source.lastPathComponent)
         }
 

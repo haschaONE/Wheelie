@@ -36,7 +36,7 @@ public enum MetadataStripper {
         case .image: try await stripImage(source, to: temp, workDir: work)
         case .pdf: try stripPDF(source, to: temp)
         case .video, .audio: try await stripMedia(source, to: temp)
-        case .unknown: throw MetadataError.unsupported(ext.lowercased())
+        default: throw MetadataError.unsupported(ext.lowercased())
         }
 
         // Last line of defence: nothing identifying may survive.

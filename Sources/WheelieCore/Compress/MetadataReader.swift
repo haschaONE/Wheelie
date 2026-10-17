@@ -58,7 +58,7 @@ public enum MetadataReader {
         case .image: return readImage(url)
         case .pdf: return readPDF(url)
         case .video, .audio: return await readMedia(url)
-        case .unknown: return []
+        default: return []
         }
     }
 

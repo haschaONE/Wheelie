@@ -31,9 +31,9 @@ enum CompressFeature: WheelieFeature {
         ]
     }
 
-    /// Images, video, audio and PDFs, mixed freely.
+    /// Images, video, audio and PDFs, mixed freely. SVG is vector text, not something to recompress.
     static func accepts(_ files: [URL]) -> Bool {
-        files.allAre(.image, .video, .audio, .pdf)
+        files.allAre(.image, .video, .audio, .pdf) && !files.contains { $0.pathExtension.lowercased() == "svg" }
     }
 
     @MainActor

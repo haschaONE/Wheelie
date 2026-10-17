@@ -9,7 +9,7 @@ import XCTest
 
 final class MetadataTests: XCTestCase {
     func testReaderFindsGPSCameraAndDates() throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let jpg = dir.appendingPathComponent("photo.jpg")
         try writeImage(noiseImage(400, 300), to: jpg, type: .jpeg, properties: privateMetadata())
 
@@ -28,7 +28,7 @@ final class MetadataTests: XCTestCase {
     }
 
     func testStripJPEGRemovesEXIFAndGPSLosslessly() async throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let jpg = dir.appendingPathComponent("photo.jpg")
         try writeImage(noiseImage(400, 300), to: jpg, type: .jpeg, properties: privateMetadata())
         // Add what cameras and editors leave behind: a second EXIF block with an embedded thumbnail
@@ -66,7 +66,7 @@ final class MetadataTests: XCTestCase {
     }
 
     func testStripPNGLosslesslyKeepsOrientation() async throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let png = dir.appendingPathComponent("shot.png")
         var meta = privateMetadata()
         meta[kCGImagePropertyOrientation] = 6
@@ -86,7 +86,7 @@ final class MetadataTests: XCTestCase {
     }
 
     func testStripReencodedFormatsBakeOrientation() async throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         for (ext, type) in [("heic", UTType.heic), ("tiff", .tiff)] {
             let file = dir.appendingPathComponent("rotated.\(ext)")
             var meta = privateMetadata()
@@ -107,7 +107,7 @@ final class MetadataTests: XCTestCase {
     }
 
     func testStripPDFRemovesInfoAndXMP() async throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let pdf = dir.appendingPathComponent("doc.pdf")
         try xmpPDF().write(to: pdf)
         let before = MetadataReader.readPDF(pdf)
@@ -126,7 +126,7 @@ final class MetadataTests: XCTestCase {
 
     func testStripVideoRemovesTagsAndLocation() async throws {
         try XCTSkipIf(Tools.locate("ffmpeg") == nil, "ffmpeg not installed")
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let base = dir.appendingPathComponent("base.mp4")
         try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=15",
                                        "-f", "lavfi", "-i", "sine=frequency=440", "-t", "2", "-c:v", "libx264",
@@ -155,7 +155,7 @@ final class MetadataTests: XCTestCase {
 
     func testStripAnimatedGIFKeepsFrames() async throws {
         try XCTSkipIf(Tools.locate("ffmpeg") == nil, "ffmpeg not installed")
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let gif = dir.appendingPathComponent("anim.gif")
         try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i",
                                        "testsrc2=size=160x120:rate=5:duration=1", "-loop", "0", gif.path])
@@ -168,7 +168,7 @@ final class MetadataTests: XCTestCase {
 
     func testStripWebPWithoutReencoding() async throws {
         try XCTSkipIf(Tools.locate("cwebp") == nil || Tools.locate("webpmux") == nil, "libwebp tools not installed")
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let jpg = dir.appendingPathComponent("source.jpg")
         try writeImage(noiseImage(320, 240), to: jpg, type: .jpeg, properties: privateMetadata())
         let webp = dir.appendingPathComponent("photo.webp")
@@ -183,7 +183,7 @@ final class MetadataTests: XCTestCase {
 
     func testStripAudioTags() async throws {
         try XCTSkipIf(Tools.locate("ffmpeg") == nil, "ffmpeg not installed")
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let mp3 = dir.appendingPathComponent("song.mp3")
         try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
                                        "-metadata", "title=Private Song", "-metadata", "artist=Jane",
@@ -213,7 +213,7 @@ final class MetadataTests: XCTestCase {
 
 final class CompressTests: XCTestCase {
     func testJPEGPresetShrinksAndKeepsDates() async throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let jpg = dir.appendingPathComponent("photo.jpg")
         try writeImage(noiseImage(1200, 900), to: jpg, type: .jpeg, properties: privateMetadata(), quality: 0.98)
 
@@ -228,7 +228,7 @@ final class CompressTests: XCTestCase {
     }
 
     func testHEICStaysHEICAndStrongCapsSize() async throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let heic = dir.appendingPathComponent("photo.heic")
         try writeImage(noiseImage(3600, 2400), to: heic, type: .heic, properties: [:], quality: 0.95)
         let result = try await Compressor.compress(heic, options: CompressionOptions(goal: .preset, imageStrength: .strong))
@@ -243,7 +243,7 @@ final class CompressTests: XCTestCase {
     }
 
     func testJPEGRespectsTargetSize() async throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let jpg = dir.appendingPathComponent("photo.jpg")
         try writeImage(noiseImage(1200, 900), to: jpg, type: .jpeg, properties: [:], quality: 0.98)
         let original = ByteSize.of(jpg)
@@ -259,7 +259,7 @@ final class CompressTests: XCTestCase {
     }
 
     func testTinyTargetDownscales() async throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let jpg = dir.appendingPathComponent("big.jpg")
         try writeImage(noiseImage(1600, 1200), to: jpg, type: .jpeg, properties: [:], quality: 0.95)
         let result = try await Compressor.compress(jpg, options: CompressionOptions(goal: .maxBytes(30_000)))
@@ -269,7 +269,7 @@ final class CompressTests: XCTestCase {
     }
 
     func testWouldExceedDeletesOutput() async throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let jpg = dir.appendingPathComponent("small.jpg")
         try writeImage(noiseImage(320, 240), to: jpg, type: .jpeg, properties: [:], quality: 0.05)
         do {
@@ -284,7 +284,7 @@ final class CompressTests: XCTestCase {
     }
 
     func testUnreachableTarget() async throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let jpg = dir.appendingPathComponent("photo.jpg")
         try writeImage(noiseImage(600, 400), to: jpg, type: .jpeg, properties: [:], quality: 0.9)
         do {
@@ -297,7 +297,7 @@ final class CompressTests: XCTestCase {
     }
 
     func testPNGPaletteCompression() async throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let png = dir.appendingPathComponent("art.png")
         try writeImage(noiseImage(320, 240, alpha: true), to: png, type: .png, properties: [:])
 
@@ -335,7 +335,7 @@ final class CompressTests: XCTestCase {
 
     func testWebPCompression() async throws {
         try XCTSkipIf(Tools.locate("cwebp") == nil, "cwebp not installed")
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let png = dir.appendingPathComponent("source.png")
         try writeImage(noiseImage(640, 480), to: png, type: .png, properties: [:])
         let webp = dir.appendingPathComponent("photo.webp")
@@ -347,7 +347,7 @@ final class CompressTests: XCTestCase {
 
     func testAnimatedGIFCompression() async throws {
         try XCTSkipIf(Tools.locate("ffmpeg") == nil, "ffmpeg not installed")
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let gif = dir.appendingPathComponent("anim.gif")
         try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=240x180:rate=10:duration=1",
                                        "-t", "1", "-vf", "noise=alls=20:allf=t,split[a][b];[a]palettegen[p];[b][p]paletteuse",
@@ -362,7 +362,7 @@ final class CompressTests: XCTestCase {
 
     func testVideoPresetAndTargetSize() async throws {
         try XCTSkipIf(Tools.locate("ffmpeg") == nil, "ffmpeg not installed")
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let clip = dir.appendingPathComponent("clip.mov")
         try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30",
                                        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000", "-t", "3",
@@ -386,7 +386,7 @@ final class CompressTests: XCTestCase {
 
     func testAudioCompression() async throws {
         try XCTSkipIf(Tools.locate("ffmpeg") == nil, "ffmpeg not installed")
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let wav = dir.appendingPathComponent("tone.wav")
         try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=5",
                                        "-ac", "2", wav.path])
@@ -400,7 +400,7 @@ final class CompressTests: XCTestCase {
     }
 
     func testPDFWithLargeImageShrinks() async throws {
-        let dir = try makeTempDir()
+        let dir = try compressTempDir()
         let pdf = dir.appendingPathComponent("scan.pdf")
         let image = NSImage(cgImage: noiseImage(1800, 1350), size: NSSize(width: 600, height: 450))
         let doc = PDFDocument()
@@ -435,7 +435,7 @@ final class CompressTests: XCTestCase {
 
 // MARK: - Fixtures
 
-private func makeTempDir() throws -> URL {
+private func compressTempDir() throws -> URL {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("wheelie-compress-tests-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir
