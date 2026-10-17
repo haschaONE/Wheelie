@@ -25,7 +25,7 @@ final class TempWorkspace: Sendable {
 /// Window-scoped shortcuts that work no matter which control has focus:
 /// Space plays (unless typing), ⌘↩ exports, Esc / ⌘W close, Delete removes, ←/→ nudge, scroll pans the timeline.
 @MainActor
-final class EditorKeyMonitor {
+final class AudioEditorKeyMonitor {
     let windowID: String
     var onSpace: (() -> Void)?
     var onExport: (() -> Void)?
@@ -118,7 +118,7 @@ class AudioEditorModel: ObservableObject {
     let player = AudioPlayback()
     let timeline = TimelineController()
     let temp = TempWorkspace()
-    let keys: EditorKeyMonitor
+    let keys: AudioEditorKeyMonitor
     private var started = false
     private var closeObserver: NSObjectProtocol?
     var tasks: [String: Task<Void, Never>] = [:]
@@ -136,7 +136,7 @@ class AudioEditorModel: ObservableObject {
         self.tool = tool
         self.files = files
         self.windowID = windowID
-        self.keys = EditorKeyMonitor(windowID: windowID)
+        self.keys = AudioEditorKeyMonitor(windowID: windowID)
     }
 
     func start() {
