@@ -41,6 +41,8 @@ public enum VideoToolRunner {
         let reportsProgress = progress != nil && (expectedDuration ?? 0) > 0
         if reportsProgress { full += ["-progress", "pipe:1"] }
         full += arguments
+        // Same demuxer allowlist / local-only protocols as Tools.run (see Tools.hardenFFmpegInputs).
+        full = try Tools.hardenFFmpegInputs(full)
         let handle = VideoToolProcess()
         do {
             try await withTaskCancellationHandler {

@@ -61,3 +61,19 @@ final class SecurityTests: XCTestCase {
         XCTAssertEqual(out.lastPathComponent, "a 2.jpg")
     }
 }
+
+final class VideoRunnerSecurityTests: XCTestCase {
+    func testVideoRunnerRefusesPlaylistInput() async throws {
+        try XCTSkipIf(Tools.locate("ffmpeg") == nil, "ffmpeg not installed")
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("wheelie-sec-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let fake = dir.appendingPathComponent("clip.mp4")
+        try Data("#EXTM3U\n#EXTINF:1,\nfile:///etc/hosts\n".utf8).write(to: fake)
+        do {
+            try await VideoToolRunner.ffmpeg(["-i", fake.path, "-y", dir.appendingPathComponent("o.mp4").path])
+            XCTFail("expected refusal")
+        } catch {
+            XCTAssertTrue(error is UnsafeMediaInputError, "\(error)")
+        }
+    }
+}

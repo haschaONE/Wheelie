@@ -58,6 +58,8 @@ UI goes in `Sources/Wheelie/Features/<Name>/`. Generate test fixtures at runtime
 ## Rules
 
 - Never overwrite or modify the original file; write new files via `OutputNaming`.
+- Launch ffmpeg/ffprobe only via `Tools.run`/`Tools.capture`, or pass the arguments through
+  `Tools.hardenFFmpegInputs` first (demuxer allowlist + local-only protocols for every input).
 - No third-party Swift packages. Apple frameworks + Homebrew CLI tools only
   (check with `Tools.locate`, throw `ToolError.missing` if absent).
 - Swift 5 language mode, macOS 14+. UI code is `@MainActor`.
