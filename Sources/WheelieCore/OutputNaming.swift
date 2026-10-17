@@ -14,7 +14,9 @@ public enum OutputNaming {
         let base = source.deletingPathExtension().lastPathComponent + suffix
         var candidate = dir.appendingPathComponent(base).appendingPathExtension(ext)
         var n = 2
-        while fileManager.fileExists(atPath: candidate.path) {
+        // attributesOfItem doesn't follow a final symlink, so a dangling link counts as taken
+        // (fileExists would say "free" and the write would go through the link).
+        while (try? fileManager.attributesOfItem(atPath: candidate.path)) != nil {
             candidate = dir.appendingPathComponent("\(base) \(n)").appendingPathExtension(ext)
             n += 1
         }
