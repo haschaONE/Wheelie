@@ -39,7 +39,7 @@ public enum Tools {
         let exe = name.hasPrefix("/") ? URL(fileURLWithPath: name) : locate(name)
         guard let exe, FileManager.default.isExecutableFile(atPath: exe.path) else { throw ToolError.missing(name) }
         let isFFmpeg = ["ffmpeg", "ffprobe"].contains(exe.lastPathComponent)
-        let finalArguments = isFFmpeg ? try hardenFFmpegInputs(arguments) : arguments
+        let finalArguments = isFFmpeg ? try hardenFFmpegInputs(arguments, probe: exe.lastPathComponent == "ffprobe") : arguments
         return try await withCheckedThrowingContinuation { cont in
             let process = Process()
             process.executableURL = exe
@@ -76,23 +76,46 @@ public struct UnsafeMediaInputError: LocalizedError {
 }
 
 extension Tools {
-    /// A file named .mp4 can really be an HLS/concat playlist that makes ffmpeg read
-    /// other local files or URLs into the output. For every `-i <file>` that has no
-    /// explicit `-f` from us, refuse playlist content and restrict protocols to local files.
-    static func hardenFFmpegInputs(_ arguments: [String]) throws -> [String] {
+    /// Demuxers ffmpeg/ffprobe may use for a local file. Playlist and manifest demuxers
+    /// (hls, dash, concat, sdp, ...) are deliberately absent, so a file can never make
+    /// ffmpeg open other files or URLs, whatever its contents or extension.
+    static let mediaDemuxers = [
+        "mov", "mp4", "m4a", "3gp", "3g2", "mj2", "matroska", "webm", "avi", "asf", "flv", "mpegts",
+        "mpeg", "mpegvideo", "mxf", "dv", "nut", "ogg", "mp3", "wav", "w64", "flac", "aac", "ac3", "eac3",
+        "dts", "truehd", "aiff", "caf", "amr", "au", "ape", "wv", "tta", "mpc", "mpc8", "tak", "voc",
+        "m4v", "h264", "hevc", "mjpeg", "ivf", "obu", "yuv4mpegpipe", "gif", "apng", "image2",
+        "png_pipe", "jpeg_pipe", "webp_pipe", "bmp_pipe", "tiff_pipe", "gif_pipe", "svg_pipe",
+        "psd_pipe", "ppm_pipe", "pam_pipe", "j2k_pipe", "jpegxl_pipe", "qoi_pipe", "dpx_pipe",
+        "exr_pipe", "srt", "ass", "webvtt",
+    ]
+
+    /// Applies the demuxer allowlist and a local-only protocol list to every file input.
+    /// ffmpeg: each `-i <file>`; an explicit `-f X` we pass (e.g. our own concat list) is
+    /// added to that input's allowlist. ffprobe: options are prepended for its one input.
+    static func hardenFFmpegInputs(_ arguments: [String], probe: Bool = false) throws -> [String] {
+        let fm = FileManager.default
+        func guardFile(_ path: String) throws {
+            if looksLikePlaylist(path) { throw UnsafeMediaInputError(file: (path as NSString).lastPathComponent) }
+        }
+        let allow = mediaDemuxers.joined(separator: ",")
+        if probe {
+            for arg in arguments where fm.fileExists(atPath: arg) { try guardFile(arg) }
+            return ["-protocol_whitelist", "file,pipe", "-format_whitelist", allow] + arguments
+        }
         var result: [String] = []
-        var explicitFormat = false
+        var explicitFormat: String?
         var index = 0
         while index < arguments.count {
             let arg = arguments[index]
-            if arg == "-f" { explicitFormat = true }
+            if arg == "-f", index + 1 < arguments.count { explicitFormat = arguments[index + 1] }
             if arg == "-i", index + 1 < arguments.count {
                 let input = arguments[index + 1]
-                if !explicitFormat, FileManager.default.fileExists(atPath: input) {
-                    if looksLikePlaylist(input) { throw UnsafeMediaInputError(file: (input as NSString).lastPathComponent) }
-                    result += ["-protocol_whitelist", "file,pipe"]
+                if fm.fileExists(atPath: input) {
+                    if explicitFormat == nil { try guardFile(input) }
+                    let list = explicitFormat.map { "\($0),\(allow)" } ?? allow
+                    result += ["-protocol_whitelist", "file,pipe", "-format_whitelist", list]
                 }
-                explicitFormat = false
+                explicitFormat = nil
                 result += [arg, input]
                 index += 2
                 continue
@@ -103,12 +126,15 @@ extension Tools {
         return result
     }
 
+    /// Only for a friendly error; the demuxer allowlist is the actual protection.
     static func looksLikePlaylist(_ path: String) -> Bool {
         guard let handle = FileHandle(forReadingAtPath: path) else { return false }
         defer { try? handle.close() }
-        let head = String(decoding: (try? handle.read(upToCount: 64)) ?? Data(), as: UTF8.self)
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return head.hasPrefix("#extm3u") || head.hasPrefix("ffconcat") || head.hasPrefix("#ext-x-")
+        var head = String(decoding: (try? handle.read(upToCount: 1024)) ?? Data(), as: UTF8.self)
+        if head.hasPrefix("\u{FEFF}") { head.removeFirst() }
+        head = head.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return head.hasPrefix("#extm3u") || head.hasPrefix("#ext-x-") || head.hasPrefix("ffconcat")
+            || head.hasPrefix("<?xml") && head.contains("<mpd")
     }
 }
 
