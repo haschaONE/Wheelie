@@ -76,6 +76,13 @@ public enum PDFLayout {
 
     private static func render(_ text: NSAttributedString, in context: CGContext, setup: PageSetup, pagesSoFar: Int) throws -> Int {
         let storage = NSTextStorage(attributedString: text)
+        // TextKit writes its own PDF link annotation for every .link it draws. Take the links out first and
+        // annotate only the ones LinkPolicy allows, so no javascript:/file:/anchor target reaches the PDF.
+        var links: [(range: NSRange, url: URL)] = []
+        storage.enumerateAttribute(.link, in: NSRange(location: 0, length: storage.length)) { value, range, _ in
+            if let url = LinkPolicy.externalURL(value) { links.append((range, url)) }
+        }
+        storage.removeAttribute(.link, range: NSRange(location: 0, length: storage.length))
         let layout = NSLayoutManager()
         layout.allowsNonContiguousLayout = false
         storage.addLayoutManager(layout)
@@ -113,7 +120,7 @@ public enum PDFLayout {
                 layout.drawGlyphs(forGlyphRange: glyphs, at: origin)
                 NSGraphicsContext.restoreGraphicsState()
                 context.restoreGState()
-                addLinks(layout: layout, container: container, glyphs: glyphs, storage: storage, context: context, setup: setup)
+                addLinks(links, layout: layout, container: container, glyphs: glyphs, context: context, setup: setup)
                 context.endPDFPage()
                 drawn += 1
             }
@@ -121,12 +128,12 @@ public enum PDFLayout {
         return drawn
     }
 
-    private static func addLinks(layout: NSLayoutManager, container: NSTextContainer, glyphs: NSRange,
-                                 storage: NSTextStorage, context: CGContext, setup: PageSetup) {
+    private static func addLinks(_ links: [(range: NSRange, url: URL)], layout: NSLayoutManager, container: NSTextContainer,
+                                 glyphs: NSRange, context: CGContext, setup: PageSetup) {
         let characters = layout.characterRange(forGlyphRange: glyphs, actualGlyphRange: nil)
-        storage.enumerateAttribute(.link, in: characters) { value, range, _ in
-            let url = (value as? URL) ?? (value as? String).flatMap(URL.init(string:))
-            guard let url else { return }
+        for (linkRange, url) in links {
+            let range = NSIntersectionRange(linkRange, characters)
+            guard range.length > 0 else { continue }
             let linkGlyphs = layout.glyphRange(forCharacterRange: range, actualCharacterRange: nil)
             layout.enumerateEnclosingRects(forGlyphRange: linkGlyphs, withinSelectedGlyphRange: NSRange(location: NSNotFound, length: 0),
                                            in: container) { rect, _ in

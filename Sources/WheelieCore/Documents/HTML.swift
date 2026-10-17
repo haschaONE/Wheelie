@@ -16,13 +16,12 @@ enum HTMLReader {
     }
 
     /// `xhtml: true` tries a strict XML parse first (keeps SVG, MathML and EPUB markup intact).
-    static func parse(_ html: String, xhtml: Bool, resolver: Resolver?) throws -> DocModel {
-        guard html.count <= DocumentLimits.maxTextCharacters else {
+    static func parse(_ source: String, xhtml: Bool, resolver: Resolver?) throws -> DocModel {
+        guard source.count <= DocumentLimits.maxTextCharacters else {
             throw DocumentError.tooLarge("The document text exceeds the conversion limit.")
         }
-        if html.range(of: "<!ENTITY", options: .caseInsensitive) != nil {
-            throw DocumentError.unsupported("HTML entity declarations are not supported.")
-        }
+        // Refuses internal DTD subsets / entity declarations anywhere; strips harmless DOCTYPEs.
+        let html = try XMLSafety.prepare(source, what: "The HTML document", htmlDoctype: true)
         var document: XMLDocument?
         if xhtml { document = try? XMLDocument(data: Data(html.utf8), options: [.nodeLoadExternalEntitiesNever]) }
         if document == nil {
@@ -37,17 +36,19 @@ enum HTMLReader {
         return DocModel(title: title?.isEmpty == false ? title : nil, blocks: walker.blocks)
     }
 
+    /// Resolves `<img src>` only to regular files inside the document's folder (see `LocalResource`).
     static func fileResolver(baseURL: URL?) -> Resolver {
-        return { href in
-            if href.hasPrefix("data:") { return nil }
-            guard let url = URL(string: href, relativeTo: baseURL) ?? baseURL.map({ URL(fileURLWithPath: href, relativeTo: $0) }),
-                  url.isFileURL else { return nil }
-            return try? Data(contentsOf: url)
-        }
+        guard let folder = baseURL else { return { _ in nil } }
+        return { href in LocalResource.read(href, inside: folder) }
     }
 
-    /// Bytes → String: BOM / UTF-8 first, then the declared charset, then Windows-1252.
+    /// Bytes → String: BOM / BOM-less UTF-16/32 and declared XML encodings first (as a parser would),
+    /// then UTF-8, a declared charset, then Windows-1252.
     static func decode(_ data: Data) -> String {
+        let b = [UInt8](data.prefix(4))
+        if b.starts(with: [0xFE, 0xFF]) || b.starts(with: [0xFF, 0xFE]) || b.starts(with: [0x00, 0x3C]) || b.starts(with: [0x3C, 0x00])
+            || b.starts(with: [0x00, 0x00]) || b.starts(with: [0xEF, 0xBB, 0xBF]) || String(decoding: data.prefix(5), as: UTF8.self) == "<?xml",
+            let s = try? XMLSafety.decode(data, what: "The HTML document") { return s }
         if let s = String(data: data, encoding: .utf8) { return s }
         let head = String(decoding: data.prefix(2048), as: UTF8.self).lowercased()
         if head.contains("charset=utf-16") || data.starts(with: [0xFF, 0xFE]) || data.starts(with: [0xFE, 0xFF]),
@@ -176,7 +177,7 @@ enum HTMLReader {
                 flush()
                 if let table = try readTable(element, depth: depth) { blocks.append(.table(table)) }
             case "a":
-                if let href = element.attr("href"), href.hasPrefix("http") || href.hasPrefix("mailto:") { link = href }
+                if let href = LinkPolicy.sanitize(element.attr("href")) { link = href }
                 try walkChildren(element, depth)
             default:
                 if Walker.blockElements.contains(name) {

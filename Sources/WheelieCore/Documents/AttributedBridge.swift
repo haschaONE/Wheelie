@@ -427,10 +427,14 @@ enum AttributedReader {
         return runs.merged()
     }
 
+    /// Only in-memory data: a symlink/folder wrapper is skipped (asking it for `regularFileContents`
+    /// raises, and its cell image may come from a file outside the document).
     static func image(from attachment: NSTextAttachment) -> DocImage? {
-        if let data = attachment.fileWrapper?.regularFileContents ?? attachment.contents, let image = DocImage(data: data) {
-            return image
+        if let wrapper = attachment.fileWrapper {
+            guard wrapper.isRegularFile, let data = wrapper.regularFileContents else { return nil }
+            return DocImage(data: data)
         }
+        if let data = attachment.contents { return DocImage(data: data) }
         if let image = attachment.image ?? (attachment.attachmentCell as? NSTextAttachmentCell)?.image,
            let tiff = image.tiffRepresentation {
             return DocImage(data: tiff)

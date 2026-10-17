@@ -30,15 +30,16 @@ public struct DocStyle: OptionSet, Hashable, Sendable {
 }
 
 /// A span of text with one style. "\n" inside a run is a hard line break.
+/// `link` always passes `LinkPolicy` (http/https/mailto/#anchor) — every writer relies on that.
 public struct DocRun: Equatable, Sendable {
     public var text: String
     public var style: DocStyle
-    public var link: String?
+    public private(set) var link: String?
 
     public init(_ text: String, style: DocStyle = [], link: String? = nil) {
         self.text = text
         self.style = style
-        self.link = link
+        self.link = LinkPolicy.sanitize(link)
     }
 }
 
