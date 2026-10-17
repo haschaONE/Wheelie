@@ -1,4 +1,5 @@
 import AppKit
 
-/// Document conversions (wheel items beyond OutputFormat, if any). Stub — to be implemented.
+/// Document conversions live in the inner ring: `OutputFormat` + `Converter` route documents, EPUB,
+/// spreadsheets, presentations and PDF reflow to `WheelieCore/Documents`. Nothing extra on the outer ring yet.
 enum DocumentsFeature: WheelieFeature {}
