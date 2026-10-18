@@ -11,19 +11,36 @@ public enum VideoToolOps {
     static func probeVideo(_ url: URL) async throws -> VideoToolInfo {
         let info = try await VideoToolProbe.probe(url)
         guard info.hasVideo else { throw VideoToolError.noVideoTrack }
+        guard info.duration > 0 else { throw VideoToolError.unknownDuration }
         return info
+    }
+
+    /// Frame start times around `time`; the frame grid when ffprobe can't list them.
+    static func frames(_ source: URL, near time: Double, info: VideoToolInfo) async -> VideoFrameTimes {
+        let listed = try? await VideoToolProbe.frameTimes(source, near: time, startTime: info.startTime,
+                                                          frameDuration: info.frameDuration)
+        return listed ?? VideoFrameTimes(frameDuration: info.frameDuration)
     }
 
     // MARK: Trim
 
-    /// True when a stream copy starting at `start` is frame-exact: the start is 0 or on a keyframe.
-    public static func canStreamCopy(start: Double, keyframes: [Double], frameDuration: Double) -> Bool {
+    /// Containers whose demuxer seeks by presentation time (ffmpeg's AVFMT_SEEK_TO_PTS: the
+    /// MP4/QuickTime family). Others (Matroska, WebM, MPEG-TS, AVI) seek by decode time, and ffmpeg
+    /// backs the seek off further for streams with B-frames, so `-ss` with `-c copy` can land a
+    /// whole GOP before the keyframe the start is on.
+    static let presentationSeekingContainers: Set<String> = ["mp4", "m4v", "mov", "3gp", "3g2"]
+
+    /// True when a stream copy from `start` begins on exactly the frame shown there: the start is
+    /// 0, or the shown frame is a keyframe of a container that seeks by presentation time.
+    public static func canStreamCopy(start: Double, frames: VideoFrameTimes, container: String) -> Bool {
         if start <= 0.001 { return true }
-        let tolerance = max(0.001, frameDuration / 2)
-        return keyframes.contains { abs($0 - start) <= tolerance }
+        guard presentationSeekingContainers.contains(container.lowercased()) else { return false }
+        return frames.showsKeyframe(at: start)
     }
 
     /// `accurate`: re-encode for frame-exact cuts unless the start already sits on a keyframe.
+    /// The frame shown at `start` is the first one kept and the frame shown at `end` the first one
+    /// dropped, as the preview shows them.
     /// Not accurate: stream copy, which starts at the keyframe before `start`.
     public static func trim(_ source: URL, start: Double, end: Double, accurate: Bool = true,
                             directory: URL? = nil, progress: Progress? = nil) async throws -> URL {
@@ -43,18 +60,33 @@ public enum VideoToolOps {
 
     static func exportRange(_ source: URL, info: VideoToolInfo, range: VideoClipRange, accurate: Bool,
                             suffix: String, directory: URL?, progress: Progress?) async throws -> URL {
-        var copy = !accurate
+        var start = range.start, end = range.end
+        var encoding: VideoToolEncoding?
         if accurate {
-            let keyframes = range.start > 0.001
-                ? ((try? await VideoToolProbe.keyframeTimes(source, near: range.start)) ?? []) : []
-            copy = canStreamCopy(start: range.start, keyframes: keyframes, frameDuration: info.frameDuration)
+            // ffmpeg keeps frames from the first one starting at or after a time; the preview shows
+            // the last one starting at or before it. Cut just before the shown frames instead.
+            if end < info.duration - 0.001 {
+                end = await frames(source, near: end, info: info).cut(at: end)
+            }
+            if start > 0.001 {
+                let near = await frames(source, near: start, info: info)
+                if canStreamCopy(start: start, frames: near, container: source.pathExtension) {
+                    // Copying begins at the keyframe at or before -ss: keep -ss safely past it.
+                    start = max(start, near.shownFrame(at: start) + 0.00001)
+                } else {
+                    start = near.cut(at: start)
+                    encoding = VideoToolEncoding.matching(source)
+                }
+            }
+            // A range inside a single frame (very low frame rates) still keeps that frame.
+            if end <= start + 0.001 { end = range.end }
         }
-        let encoding = copy ? nil : VideoToolEncoding.matching(source)
+        let length = max(0, end - start)
         let ext = encoding?.fileExtension ?? source.pathExtension
         let output = OutputNaming.uniqueURL(for: source, ext: ext.isEmpty ? "mp4" : ext, suffix: suffix, in: directory)
-        let args = VideoToolArgs.trim(input: source, output: output, start: range.start, duration: range.duration,
+        let args = VideoToolArgs.trim(input: source, output: output, start: start, duration: length,
                                       encoding: encoding)
-        try await VideoToolRunner.ffmpeg(args, expectedDuration: range.duration, cleanup: [output], progress: progress)
+        try await VideoToolRunner.ffmpeg(args, expectedDuration: length, cleanup: [output], progress: progress)
         return output
     }
 
@@ -93,7 +125,15 @@ public enum VideoToolOps {
             }
             return outputs
         case .joinRest:
-            let ranges = kept.map { clips[$0] }
+            // The trim filter keeps frames starting at or after `start`: cut just before the frame
+            // shown at each split point so it opens its clip, as in the preview.
+            var cuts: [Double] = []
+            for point in points.sorted() {
+                let cut = await frames(source, near: point, info: info).cut(at: point)
+                cuts.append(cut > (cuts.last ?? 0) + 0.001 ? cut : point)
+            }
+            let cutClips = VideoSplitPlan.clips(points: cuts, duration: info.duration)
+            let ranges = kept.map { cutClips[$0] }
             let encoding = VideoToolEncoding.matching(source)
             let output = OutputNaming.uniqueURL(for: source, ext: encoding.fileExtension, suffix: " edited", in: directory)
             let args = VideoToolArgs.keepRanges(input: source, output: output, ranges: ranges, hasAudio: info.hasAudio,
@@ -114,13 +154,17 @@ public enum VideoToolOps {
     public static let joinVideoMessage = "Every selected file must contain a video track."
 
     /// Output frame size for a join: the first clip's, or the largest; even sides.
+    /// Non-square pixels (HDV, DV, DVD) count at their displayed shape, as the join filter scales them.
     public static func joinSize(_ infos: [VideoToolInfo], resolution: JoinResolution) -> (width: Int, height: Int) {
+        func squareWidth(_ info: VideoToolInfo) -> Int {
+            Int((Double(info.displayWidth) * info.displayPixelAspect).rounded())
+        }
         let pick: VideoToolInfo?
         switch resolution {
         case .first: pick = infos.first
-        case .largest: pick = infos.max { $0.displayWidth * $0.displayHeight < $1.displayWidth * $1.displayHeight }
+        case .largest: pick = infos.max { squareWidth($0) * $0.displayHeight < squareWidth($1) * $1.displayHeight }
         }
-        let w = max(2, (pick?.displayWidth ?? 1280) / 2 * 2)
+        let w = max(2, (pick.map(squareWidth) ?? 1280) / 2 * 2)
         let h = max(2, (pick?.displayHeight ?? 720) / 2 * 2)
         return (w, h)
     }
@@ -220,7 +264,8 @@ public enum VideoToolOps {
         let snapped = VideoCropMath.even(rect.cgRect, width: W, height: H)
         let encoding = VideoToolEncoding.matching(source)
         let output = OutputNaming.uniqueURL(for: source, ext: encoding.fileExtension, suffix: " cropped", in: directory)
-        let args = VideoToolArgs.crop(input: source, output: output, rect: snapped, encoding: encoding)
+        let args = VideoToolArgs.crop(input: source, output: output, rect: snapped, encoding: encoding,
+                                      audioCodec: info.audioCodec)
         try await VideoToolRunner.ffmpeg(args, expectedDuration: info.duration, cleanup: [output], progress: progress)
         return output
     }
@@ -229,7 +274,7 @@ public enum VideoToolOps {
 
     public static let snapshotEmptyMessage = "Add a frame to save."
 
-    /// Saves full-resolution frames as "<name> 00m12s.png".
+    /// Saves full-resolution frames as "<name> 00m12s.png": at each time, the frame the preview shows.
     public static func snapshots(_ source: URL, times: [Double], format: VideoSnapshotFormat = .png,
                                  directory: URL? = nil, progress: Progress? = nil) async throws -> [URL] {
         guard !times.isEmpty else { throw VideoToolError(snapshotEmptyMessage) }
@@ -241,7 +286,10 @@ public enum VideoToolOps {
                 let t = min(max(0, time), last)
                 let output = OutputNaming.uniqueURL(for: source, ext: format.rawValue,
                                                     suffix: " " + VideoToolTimecode.fileStamp(t), in: directory)
-                try await extractFrame(to: output, at: t, nearEnd: t > info.duration - 1) { time, window in
+                // An accurate -ss returns the first frame starting at or after its time; seek to
+                // just before the frame shown at t so that frame is the one saved.
+                let seek = await frames(source, near: t, info: info).cut(at: t)
+                try await extractFrame(to: output, at: seek, nearEnd: t > info.duration - 1) { time, window in
                     VideoToolArgs.snapshot(input: source, output: output, time: time, format: format,
                                            lastFrameWithin: window)
                 }
@@ -288,16 +336,23 @@ public enum VideoToolOps {
         if let message = VideoRedactPlan.validationError(boxes, width: W, height: H, duration: info.duration) {
             throw VideoToolError(message)
         }
-        let snapped = boxes.map { box -> VideoRedactBox in
+        var snapped: [VideoRedactBox] = []
+        for box in boxes {
             var b = box
             b.rect = VideoCropMath.even(box.rect.cgRect, width: W, height: H)
             b.end = min(box.end, info.duration)
-            return b
+            // `between(t,start,…)` covers frames starting at or after `start`, but the box was lined
+            // up on the frame shown at `start`, which usually starts before it. Begin just before
+            // that frame so it is covered too.
+            if box.start > 0 {
+                b.start = await frames(source, near: box.start, info: info).cut(at: box.start)
+            }
+            snapped.append(b)
         }
         let encoding = VideoToolEncoding.matching(source)
         let output = OutputNaming.uniqueURL(for: source, ext: encoding.fileExtension, suffix: " redacted", in: directory)
         let args = VideoToolArgs.redact(input: source, output: output, boxes: snapped, style: style,
-                                        duration: info.duration, encoding: encoding)
+                                        duration: info.duration, encoding: encoding, audioCodec: info.audioCodec)
         try await VideoToolRunner.ffmpeg(args, expectedDuration: info.duration, cleanup: [output], progress: progress)
         return output
     }
@@ -307,13 +362,22 @@ public enum VideoToolOps {
 public enum VideoToolFrames {
     /// One frame at `time`, at most `maxHeight` pixels tall. `duration` (when known) limits
     /// the end-of-file fallback to times in the last second.
-    public static func frame(_ url: URL, at time: Double, maxHeight: Int, duration: Double? = nil) async throws -> CGImage {
+    /// `exact`: the frame shown at `time` (the last one starting at or before it, as AVPlayer and
+    /// the exports pick it), found from the packet times; `startTime` is the file's
+    /// `VideoToolInfo.startTime`. Not exact: a quick seek, which may return the next frame.
+    public static func frame(_ url: URL, at time: Double, maxHeight: Int, duration: Double? = nil,
+                             startTime: Double = 0, exact: Bool = true) async throws -> CGImage {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("wheelie-frame-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let output = dir.appendingPathComponent("frame.jpg")
         let nearEnd = duration.map { time > $0 - 1 } ?? true
-        try await VideoToolOps.extractFrame(to: output, at: max(0, time), nearEnd: nearEnd) { t, window in
+        var seek = max(0, time)
+        if exact, seek > 0, let frames = try? await VideoToolProbe.frameTimes(url, near: seek, startTime: startTime) {
+            seek = frames.cut(at: seek)
+        }
+        try Task.checkCancellation()
+        try await VideoToolOps.extractFrame(to: output, at: seek, nearEnd: nearEnd) { t, window in
             VideoToolArgs.thumbnail(input: url, output: output, time: t, maxHeight: maxHeight, lastFrameWithin: window)
         }
         guard let src = CGImageSourceCreateWithURL(output as CFURL, nil),

@@ -31,6 +31,130 @@ final class VideoToolsLogicTests: XCTestCase {
         XCTAssertNil(VideoToolTimecode.parse("-3"))
     }
 
+    /// A crafted DURATION tag of 1e300 used to trap converting to Int and crash the app.
+    func testHugeDurationsDoNotOverflow() throws {
+        XCTAssertNil(VideoToolTimecode.parse("1e300"))
+        XCTAssertNil(VideoToolTimecode.parse("1e17"))
+        XCTAssertEqual(VideoToolTimecode.format(1e300), VideoToolTimecode.format(VideoToolTimecode.maximumSeconds))
+        XCTAssertEqual(VideoToolTimecode.format(.infinity), "0:00.00")
+        XCTAssertFalse(VideoToolTimecode.fileStamp(1e300).isEmpty)
+        XCTAssertEqual(VideoToolTimecode.fileStamp(-.infinity), "00m00s")
+
+        let crafted = try VideoToolProbe.parse(Data("""
+        {"streams":[{"codec_type":"video","width":320,"height":240,"tags":{"DURATION":"1e300"}}],"format":{}}
+        """.utf8))
+        XCTAssertEqual(crafted.duration, 0)
+        let hugeFormat = try VideoToolProbe.parse(Data("""
+        {"streams":[{"codec_type":"video","width":320,"height":240}],"format":{"duration":"1e300"}}
+        """.utf8))
+        XCTAssertEqual(hugeFormat.duration, 0)
+        let hugeRotation = try VideoToolProbe.parse(Data("""
+        {"streams":[{"codec_type":"video","width":320,"height":240,"side_data_list":[{"rotation":1e300}]}],
+         "format":{"duration":"2"}}
+        """.utf8))
+        XCTAssertEqual(hugeRotation.rotation, 0)
+    }
+
+    /// The frame on screen at a playhead is the last one starting at or before it; ffmpeg starts at
+    /// the first one at or after a time, so exports cut just before the shown frame.
+    func testFrameTimesShownFrameAndCut() {
+        let fd = 1001.0 / 30000
+        let starts = (0..<400).map { Double($0) * fd }
+        let frames = VideoFrameTimes(starts: starts, keyframes: [0, 60 * fd], frameDuration: fd)
+        // 12.34 s is inside frame 369 (starts 12.3123): that frame is shown, and the cut lies before it.
+        XCTAssertEqual(frames.shownFrame(at: 12.34), 369 * fd, accuracy: 1e-9)
+        let cut = frames.cut(at: 12.34)
+        XCTAssertLessThan(cut, 369 * fd)
+        XCTAssertGreaterThan(cut, 368 * fd)
+        // Six-decimal rounding for ffmpeg can't push it past the frame either.
+        XCTAssertLessThan(Double(VideoToolArgs.number(cut))!, 369 * fd)
+        XCTAssertGreaterThan(Double(VideoToolArgs.number(cut))!, 368 * fd)
+        // On a frame start (frame stepping), that frame is shown, even with float noise below it.
+        XCTAssertEqual(frames.shownFrame(at: 61 * fd - 1e-9), 61 * fd, accuracy: 1e-9)
+        XCTAssertLessThan(frames.cut(at: 61 * fd), 61 * fd)
+        XCTAssertGreaterThan(frames.cut(at: 61 * fd), 60 * fd)
+        XCTAssertEqual(frames.cut(at: 0.01), 0)
+        XCTAssertTrue(frames.showsKeyframe(at: 2.0153))
+        XCTAssertFalse(frames.showsKeyframe(at: 1.99))
+
+        // Without a frame list: the frame grid.
+        let grid = VideoFrameTimes(frameDuration: fd)
+        XCTAssertEqual(grid.shownFrame(at: 12.34), 369 * fd, accuracy: 1e-9)
+        XCTAssertEqual(grid.cut(at: 12.34), 368.5 * fd, accuracy: 1e-9)
+        XCTAssertFalse(grid.showsKeyframe(at: 0.5))
+
+        // Frames offset from the grid (Matroska with B-frames: 0.021 + n × fd).
+        let offset = VideoFrameTimes(starts: (0..<100).map { 0.021 + Double($0) * fd }, frameDuration: fd)
+        XCTAssertEqual(offset.shownFrame(at: 2.0153), 0.021 + 59 * fd, accuracy: 1e-9)
+        XCTAssertEqual(offset.cut(at: 0.005), 0)
+    }
+
+    func testFrameTimesParsing() throws {
+        let json = """
+        {"packets":[{"pts_time":"1.533333","flags":"__"},{"pts_time":"1.500000","flags":"K__"},
+                    {"pts_time":"N/A","flags":"K__"},{"pts_time":"1.566667","flags":"__"}],
+         "format":{"start_time":"1.500000"}}
+        """
+        let frames = try VideoToolProbe.parseFrameTimes(Data(json.utf8))
+        XCTAssertEqual(frames.starts.count, 3)
+        XCTAssertEqual(frames.starts[0], 0, accuracy: 1e-9)
+        XCTAssertEqual(frames.starts[2], 0.066667, accuracy: 1e-6)
+        XCTAssertEqual(frames.keyframes, [0])
+        XCTAssertEqual(frames.frameDuration, 1.0 / 30, accuracy: 1e-5)
+        XCTAssertEqual(try VideoToolProbe.parseFrameTimes(Data(json.utf8), frameDuration: 0.04).frameDuration, 0.04)
+    }
+
+    func testMeasuredDuration() {
+        XCTAssertEqual(VideoToolProbe.measuredDuration("0.000000,0.033000\n1.967000,0.033000\n1.950000,0.020000\nN/A,N/A\n",
+                                                       startTime: 0)!, 2, accuracy: 1e-9)
+        XCTAssertEqual(VideoToolProbe.measuredDuration("11.5,N/A\n", startTime: 1.5)!, 10, accuracy: 1e-9)
+        XCTAssertNil(VideoToolProbe.measuredDuration("", startTime: 0))
+        XCTAssertNil(VideoToolProbe.measuredDuration("1e300,0\n", startTime: 0))
+    }
+
+    func testAnamorphicShapes() {
+        let hdv = VideoToolInfo(duration: 1, width: 1440, height: 1080, fps: 25, hasAudio: false, sampleAspectRatio: 4.0 / 3)
+        XCTAssertEqual(hdv.displayPixelAspect, 4.0 / 3, accuracy: 1e-9)
+        var turned = hdv
+        turned.rotation = 90
+        XCTAssertEqual(turned.displayPixelAspect, 3.0 / 4, accuracy: 1e-9)
+
+        // A 1:1 preset on HDV is 810 × 1080 stored pixels, which display as a square.
+        let ratio = VideoCropMath.pixelRatio(1, pixelAspect: hdv.displayPixelAspect)
+        let square = VideoCropMath.largest(ratio: ratio, width: 1440, height: 1080)
+        XCTAssertEqual(square, VideoCropRect(x: 314, y: 0, width: 810, height: 1080))
+        XCTAssertEqual(Double(square.width) * hdv.displayPixelAspect / Double(square.height), 1, accuracy: 0.01)
+        XCTAssertNil(VideoCropMath.pixelRatio(nil, pixelAspect: 4.0 / 3))
+        XCTAssertEqual(VideoCropMath.pixelRatio(16.0 / 9, pixelAspect: 0), 16.0 / 9)
+
+        // Join sizes count the displayed shape: HDV joins at 1920 × 1080.
+        let size = VideoToolOps.joinSize([hdv], resolution: .first)
+        XCTAssertEqual(size.width, 1920)
+        XCTAssertEqual(size.height, 1080)
+    }
+
+    func testAudioIsCopiedOnlyWhenTheOutputCanHoldIt() {
+        let mp4 = VideoToolEncoding.mp4
+        let wmv = URL(fileURLWithPath: "/v/a.wmv")
+        XCTAssertEqual(mp4.audioArgs(keeping: wmv, codec: "wmav2"), mp4.audioArgs)
+        XCTAssertEqual(mp4.audioArgs(keeping: URL(fileURLWithPath: "/v/a.3gp"), codec: "amr_nb"), mp4.audioArgs)
+        XCTAssertEqual(mp4.audioArgs(keeping: URL(fileURLWithPath: "/v/a.flv"), codec: "nellymoser"), mp4.audioArgs)
+        XCTAssertEqual(mp4.audioArgs(keeping: wmv, codec: nil), mp4.audioArgs)
+        XCTAssertEqual(mp4.audioArgs(keeping: URL(fileURLWithPath: "/v/a.flv"), codec: "mp3"), ["-c:a", "copy"])
+        XCTAssertEqual(mp4.audioArgs(keeping: URL(fileURLWithPath: "/v/a.mp4"), codec: nil), ["-c:a", "copy"])
+        let mkv = VideoToolEncoding.matching(URL(fileURLWithPath: "/v/a.mkv"))
+        XCTAssertEqual(mkv.audioArgs(keeping: URL(fileURLWithPath: "/v/a.MKV"), codec: "truehd"), ["-c:a", "copy"])
+
+        let input = URL(fileURLWithPath: "/v/a.wmv"), output = URL(fileURLWithPath: "/v/a cropped.mp4")
+        let crop = VideoToolArgs.crop(input: input, output: output, rect: VideoCropRect(x: 0, y: 0, width: 64, height: 48),
+                                      encoding: mp4, audioCodec: "wmav2")
+        XCTAssertEqual(crop[crop.firstIndex(of: "-c:a")! + 1], "aac")
+        let redact = VideoToolArgs.redact(input: input, output: output,
+                                          boxes: [VideoRedactBox(rect: VideoCropRect(x: 0, y: 0, width: 8, height: 8), start: 0, end: 1)],
+                                          style: .black, duration: 1, encoding: mp4, audioCodec: "wmav2")
+        XCTAssertEqual(redact[redact.firstIndex(of: "-c:a")! + 1], "aac")
+    }
+
     func testAtempoChaining() {
         XCTAssertEqual(VideoToolArgs.atempoChain(0.25), [0.5, 0.5])
         XCTAssertEqual(VideoToolArgs.atempoChain(4), [2, 2])
@@ -131,12 +255,12 @@ final class VideoToolsLogicTests: XCTestCase {
         let partial = VideoRedactBox(rect: VideoCropRect(x: 10, y: 20, width: 100, height: 60), start: 1, end: 2.5)
         let whole = VideoRedactBox(rect: VideoCropRect(x: 0, y: 0, width: 40, height: 40), start: 0, end: 4)
         let black = VideoToolArgs.redactFilterGraph(boxes: [partial, whole], style: .black, duration: 4)
-        XCTAssertEqual(black, "[0:v:0]drawbox=x=10:y=20:w=100:h=60:color=black:t=fill:enable='between(t,1,2.5)',"
+        XCTAssertEqual(black, "[0:v:0]drawbox=x=10:y=20:w=100:h=60:color=black:t=fill:enable='between(t,1,2.500001)',"
                        + "drawbox=x=0:y=0:w=40:h=40:color=black:t=fill,format=yuv420p[vout]")
         let blur = VideoToolArgs.redactFilterGraph(boxes: [partial, whole], style: .blur, duration: 4)
         XCTAssertTrue(blur.hasPrefix("[0:v:0]split=3[base][src0][src1];"))
         XCTAssertTrue(blur.contains("[src0]crop=100:60:10:20,gblur="))
-        XCTAssertTrue(blur.contains("[base][fx0]overlay=x=10:y=20:enable='between(t,1,2.5)'[ov0]"))
+        XCTAssertTrue(blur.contains("[base][fx0]overlay=x=10:y=20:enable='between(t,1,2.500001)'[ov0]"))
         XCTAssertTrue(blur.contains("[ov0][fx1]overlay=x=0:y=0[ov1]"))
         XCTAssertTrue(blur.hasSuffix("[ov1]format=yuv420p[vout]"))
         let pixel = VideoToolArgs.redactFilterGraph(boxes: [partial], style: .pixelate, duration: 4)
@@ -170,7 +294,7 @@ final class VideoToolsLogicTests: XCTestCase {
                                                .init(url: URL(fileURLWithPath: "/v/b.mov"), duration: 1.5, hasAudio: false)],
                                       output: output, width: 640, height: 360, fps: 30)
         let graph = join[join.firstIndex(of: "-filter_complex")! + 1]
-        XCTAssertTrue(graph.contains("[1:v:0]scale=640:360:force_original_aspect_ratio=decrease"))
+        XCTAssertTrue(graph.contains("[1:v:0]scale='trunc(iw*sar/2)*2':ih,setsar=1,scale=640:360:force_original_aspect_ratio=decrease"))
         XCTAssertTrue(graph.contains("pad=640:360:(ow-iw)/2:(oh-ih)/2"))
         XCTAssertTrue(graph.contains("anullsrc=r=48000:cl=stereo,atrim=duration=1.5"))
         XCTAssertTrue(graph.hasSuffix("[v0][a0][v1][a1]concat=n=2:v=1:a=1[vout][aout]"))
@@ -199,12 +323,22 @@ final class VideoToolsLogicTests: XCTestCase {
         XCTAssertEqual(VideoToolEncoding.matching(URL(fileURLWithPath: "/a.MOV")).fileExtension, "mov")
     }
 
-    func testKeyframesAndStreamCopy() {
-        let keys = VideoToolProbe.parseKeyframes("0.000000,K__\n0.133333,___\n2.000000,K_\n1.000000,K__\nbad\n")
-        XCTAssertEqual(keys, [0, 1, 2])
-        XCTAssertTrue(VideoToolOps.canStreamCopy(start: 0, keyframes: [], frameDuration: 1.0 / 30))
-        XCTAssertTrue(VideoToolOps.canStreamCopy(start: 1.01, keyframes: keys, frameDuration: 1.0 / 30))
-        XCTAssertFalse(VideoToolOps.canStreamCopy(start: 1.25, keyframes: keys, frameDuration: 1.0 / 30))
+    func testStreamCopyOnlyFromTheShownKeyframe() {
+        let fd = 1001.0 / 30000
+        let frames = VideoFrameTimes(starts: (0..<150).map { Double($0) * fd }, keyframes: [0, 60 * fd, 120 * fd],
+                                     frameDuration: fd)
+        XCTAssertTrue(VideoToolOps.canStreamCopy(start: 0, frames: VideoFrameTimes(frameDuration: fd), container: "mkv"))
+        // On or inside the keyframe's own frame: copying starts on the frame shown there.
+        XCTAssertTrue(VideoToolOps.canStreamCopy(start: 60 * fd, frames: frames, container: "mp4"))
+        XCTAssertTrue(VideoToolOps.canStreamCopy(start: 2.0153, frames: frames, container: "MOV"))
+        // Half a frame before a keyframe shows the frame before it; a copy would start a GOP early.
+        XCTAssertFalse(VideoToolOps.canStreamCopy(start: 1.99, frames: frames, container: "mp4"))
+        XCTAssertFalse(VideoToolOps.canStreamCopy(start: 1.25, frames: frames, container: "mp4"))
+        // Matroska/WebM/TS seek before the keyframe when there are B-frames: always re-encode.
+        XCTAssertFalse(VideoToolOps.canStreamCopy(start: 2.0153, frames: frames, container: "mkv"))
+        XCTAssertFalse(VideoToolOps.canStreamCopy(start: 2.0153, frames: frames, container: "webm"))
+        // Unknown frame times: never assume a keyframe.
+        XCTAssertFalse(VideoToolOps.canStreamCopy(start: 2.002, frames: VideoFrameTimes(frameDuration: fd), container: "mp4"))
     }
 
     func testProgressParser() {
@@ -540,6 +674,141 @@ final class VideoToolsExportTests: XCTestCase {
         let frame = try await VideoToolFrames.frame(out, at: 1, maxHeight: 240)
         XCTAssertEqual(frame.width, 320)
         XCTAssertLessThan(brightness(frame, x: 230, y: 130), 0.1)
+    }
+
+    /// 29.97 fps, B-frames, a keyframe every 60 frames, and every frame a different flat grey
+    /// (luma 16 + 7n mod 200), losslessly encoded so frames can be told apart by brightness.
+    private func numberedFixture(_ name: String, seconds: Double = 4) async throws -> URL {
+        let url = dir.appendingPathComponent(name)
+        try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                                       "color=c=black:s=64x48:r=30000/1001,format=yuv420p,geq=lum=16+mod(7*N\\,200):cb=128:cr=128",
+                                       "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+                                       "-t", VideoToolArgs.number(seconds), "-c:v", "libx264", "-preset", "ultrafast",
+                                       "-qp", "0", "-bf", "2", "-g", "60", "-pix_fmt", "yuv420p", "-c:a", "aac", url.path])
+        return url
+    }
+
+    /// Brightness at (x, y) of frame `index` (presentation order) of `url`.
+    private func frameBrightness(_ url: URL, _ index: Int, x: Int = 32, y: Int = 24) async throws -> Double {
+        let png = dir.appendingPathComponent("frame-\(UUID().uuidString).png")
+        try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-y", "-i", url.path, "-map", "0:v:0",
+                                       "-vf", "select=eq(n\\,\(index))", "-frames:v", "1", png.path])
+        guard let src = CGImageSourceCreateWithURL(png as CFURL, nil),
+              let image = CGImageSourceCreateImageAtIndex(src, 0, nil) else { throw VideoToolError.noFrame }
+        return brightness(image, x: x, y: y)
+    }
+
+    /// Index of the source frame (among `candidates`) whose brightness is closest to `value`.
+    private func closestFrame(_ value: Double, in source: URL, candidates: [Int]) async throws -> Int {
+        var best = (index: -1, distance: Double.infinity)
+        for index in candidates {
+            let d = abs(try await frameBrightness(source, index) - value)
+            if d < best.distance { best = (index, d) }
+        }
+        return best.index
+    }
+
+    /// At 2.0153 s the preview shows frame 60 (starts 2.002); every export must start from it, not 61.
+    func testExportsUseTheFrameShownAtThePlayhead() async throws {
+        let clip = try await numberedFixture("numbered.mp4")
+
+        let shot = try await VideoToolOps.snapshots(clip, times: [2.0153], format: .png, directory: dir)
+        let shotImage = CGImageSourceCreateImageAtIndex(CGImageSourceCreateWithURL(shot[0] as CFURL, nil)!, 0, nil)!
+        let shotFrame = try await closestFrame(brightness(shotImage, x: 32, y: 24), in: clip, candidates: [59, 60, 61])
+        XCTAssertEqual(shotFrame, 60)
+
+        // Frame 60 is a keyframe in MP4: stream copied, and it starts there, not a GOP early.
+        let copied = try await VideoToolOps.trim(clip, start: 2.0153, end: 3.0153, directory: dir)
+        let copiedFirst = try await closestFrame(frameBrightness(copied, 0), in: clip, candidates: [0, 59, 60, 61])
+        XCTAssertEqual(copiedFirst, 60)
+        let copiedDuration = try await VideoToolProbe.probe(copied).duration
+        XCTAssertEqual(copiedDuration, 1, accuracy: 0.1)
+
+        // Half a frame before that keyframe the previous frame is shown: re-encode from frame 59.
+        let early = try await VideoToolOps.trim(clip, start: 1.99, end: 2.99, directory: dir)
+        let earlyFirst = try await closestFrame(frameBrightness(early, 0), in: clip, candidates: [0, 59, 60])
+        XCTAssertEqual(earlyFirst, 59)
+        let earlyDuration = try await VideoToolProbe.probe(early).duration
+        XCTAssertEqual(earlyDuration, 1, accuracy: 0.1)
+
+        // Re-encoded start inside frame 30 (starts 1.001).
+        let encoded = try await VideoToolOps.trim(clip, start: 1.0153, end: 2.0153, directory: dir)
+        let encodedFirst = try await closestFrame(frameBrightness(encoded, 0), in: clip, candidates: [29, 30, 31])
+        XCTAssertEqual(encodedFirst, 30)
+
+        // Split: the frame shown at the split point opens the next clip.
+        let joined = try await VideoToolOps.split(clip, points: [1.0153], removed: [0], mode: .joinRest, directory: dir)
+        let joinedFirst = try await closestFrame(frameBrightness(joined[0], 0), in: clip, candidates: [29, 30, 31])
+        XCTAssertEqual(joinedFirst, 30)
+
+        // Redact: a box set at 0.34 s (frame 10 shown, starts 0.3337) covers frame 10 but not frame 9.
+        let box = VideoRedactBox(rect: VideoCropRect(x: 16, y: 12, width: 32, height: 24), start: 0.34, end: 1)
+        let redacted = try await VideoToolOps.redact(clip, boxes: [box], style: .black, directory: dir)
+        let frame10 = try await frameBrightness(redacted, 10)
+        let frame9 = try await frameBrightness(redacted, 9)
+        XCTAssertLessThan(frame10, 0.02)
+        XCTAssertGreaterThan(frame9, 0.2)
+    }
+
+    /// Matroska seeks before the keyframe with B-frames: an accurate trim must not copy from there.
+    func testAccurateTrimOfMatroskaStartsAtTheStart() async throws {
+        let mp4 = try await numberedFixture("numbered.mp4")
+        let mkv = dir.appendingPathComponent("numbered.mkv")
+        try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-y", "-i", mp4.path, "-c", "copy", mkv.path])
+        let frames = try await VideoToolProbe.frameTimes(mkv, near: 2.04)
+        let out = try await VideoToolOps.trim(mkv, start: 2.04, end: 3.04, directory: dir)
+        let duration = try await VideoToolProbe.probe(out).duration
+        XCTAssertEqual(duration, 1, accuracy: 0.1)
+        // It starts on the frame shown at 2.04 on Matroska's clock (a B-frame delay later than MP4's).
+        // The listed frames start at the file's first frame, so the index is the frame number.
+        let shown = try XCTUnwrap(frames.starts.firstIndex(of: frames.shownFrame(at: 2.04)))
+        let first = try await closestFrame(frameBrightness(out, 0), in: mp4, candidates: [0, shown - 1, shown, shown + 1])
+        XCTAssertEqual(first, shown)
+    }
+
+    /// WMV's WMA audio can't be copied into the MP4 that Crop and Redact write.
+    func testCropAndRedactWMV() async throws {
+        let wmv = dir.appendingPathComponent("clip.wmv")
+        try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=25",
+                                       "-f", "lavfi", "-i", "sine=sample_rate=44100", "-t", "1",
+                                       "-c:v", "wmv2", "-c:a", "wmav2", wmv.path])
+        let cropped = try await VideoToolOps.crop(wmv, rect: VideoCropRect(x: 0, y: 0, width: 80, height: 60), directory: dir)
+        XCTAssertEqual(cropped.pathExtension, "mp4")
+        let croppedInfo = try await VideoToolProbe.probe(cropped)
+        XCTAssertTrue(croppedInfo.hasAudio)
+        XCTAssertEqual(croppedInfo.audioCodec, "aac")
+        let redacted = try await VideoToolOps.redact(wmv, boxes: [VideoRedactBox(rect: VideoCropRect(x: 0, y: 0, width: 40, height: 40),
+                                                                                 start: 0.2, end: 0.6)],
+                                                     style: .pixelate, directory: dir)
+        let redactedInfo = try await VideoToolProbe.probe(redacted)
+        XCTAssertTrue(redactedInfo.hasAudio)
+    }
+
+    /// Browser MediaRecorder-style WebM: no duration anywhere in the container.
+    func testVideoWithoutContainerDuration() async throws {
+        let webm = dir.appendingPathComponent("recorded.webm")
+        try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=30",
+                                       "-t", "2", "-c:v", "libvpx", "-deadline", "realtime", "-live", "1", "-f", "webm", webm.path])
+        let info = try await VideoToolProbe.probe(webm)
+        XCTAssertTrue(info.hasVideo)
+        XCTAssertEqual(info.duration, 2, accuracy: 0.1)
+        let out = try await VideoToolOps.trim(webm, start: 0.5, end: 1.5, directory: dir)
+        let duration = try await VideoToolProbe.probe(out).duration
+        XCTAssertEqual(duration, 1, accuracy: 0.1)
+    }
+
+    /// An HDV clip (1440×1080, 4:3 pixels) fills a 16:9 join instead of being squeezed and pillarboxed.
+    func testJoinAnamorphic() async throws {
+        let hdv = dir.appendingPathComponent("hdv.mp4")
+        try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "color=c=white:s=1440x1080:r=25",
+                                       "-t", "0.4", "-vf", "setsar=4/3", "-c:v", "libx264", "-preset", "ultrafast", hdv.path])
+        let other = try await fixture("full.mp4", size: "640x360", seconds: 0.4, audio: false, rate: 25)
+        let out = try await VideoToolOps.join([hdv, other], directory: dir)
+        let info = try await VideoToolProbe.probe(out)
+        XCTAssertEqual(info.width, 1920)
+        XCTAssertEqual(info.height, 1080)
+        let edge = try await frameBrightness(out, 0, x: 20, y: 540)
+        XCTAssertGreaterThan(edge, 0.8)
     }
 
     func testFrameExtraction() async throws {

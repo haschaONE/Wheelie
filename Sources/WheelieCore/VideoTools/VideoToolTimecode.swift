@@ -2,11 +2,20 @@ import Foundation
 
 /// Time formatting and parsing shared by the video editors.
 public enum VideoToolTimecode {
+    /// Longest duration taken seriously (about 115 days). Larger values come from damaged or
+    /// crafted files; they are treated as missing, and formatting clamps to this.
+    public static let maximumSeconds: Double = 10_000_000
+
+    /// Finite, non-negative and at most `maximumSeconds`, so whole-number conversions can't trap.
+    static func clamped(_ seconds: Double) -> Double {
+        seconds.isFinite ? min(max(0, seconds), maximumSeconds) : 0
+    }
+
     /// `65.25` -> "1:05.25"; `3725` -> "1:02:05.00".
     public static func format(_ seconds: Double, fractionDigits: Int = 2) -> String {
         let digits = max(0, min(fractionDigits, 3))
         let scale = Int(pow(10, Double(digits)))
-        let total = Int((max(0, seconds.isFinite ? seconds : 0) * Double(scale)).rounded())
+        let total = Int((clamped(seconds) * Double(scale)).rounded())
         let fraction = total % scale
         let whole = total / scale
         let h = whole / 3600, m = (whole % 3600) / 60, s = whole % 60
@@ -31,12 +40,12 @@ public enum VideoToolTimecode {
             if isLast, parts.count > 1, value >= 60 { return nil }
             total = total * 60 + value
         }
-        return total
+        return total <= maximumSeconds ? total : nil
     }
 
     /// File-name stamp for a snapshot: "00m12s", or "1h02m12s" past an hour.
     public static func fileStamp(_ seconds: Double) -> String {
-        let whole = Int(max(0, seconds).rounded(.down))
+        let whole = Int(clamped(seconds).rounded(.down))
         let h = whole / 3600, m = (whole % 3600) / 60, s = whole % 60
         return h > 0 ? String(format: "%dh%02dm%02ds", h, m, s) : String(format: "%02dm%02ds", m, s)
     }
