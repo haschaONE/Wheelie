@@ -24,6 +24,8 @@ public enum ShellSettings {
         [
             Key.wheelEnabled: true,
             Key.triggerModifier: TriggerModifier.shift.rawValue,
+            WheelMode.tools.settingsKey: TriggerModifier.command.rawValue,
+            WheelMode.actions.settingsKey: TriggerModifier.control.rawValue,
             Key.outputLocation: OutputLocation.original.rawValue,
             Key.playSounds: true,
             Key.addResultsToFloat: false,
@@ -122,5 +124,60 @@ public enum OutputLocation: String, CaseIterable, Identifiable, Sendable {
     public static func displayPath(_ path: String, home: String = NSHomeDirectory()) -> String {
         guard !home.isEmpty, path == home || path.hasPrefix(home + "/") else { return path }
         return "~" + path.dropFirst(home.count)
+    }
+}
+
+/// Tangerine-style: three wheels, each opened by tapping its own key while dragging files.
+/// ⇧ formats, ⌘ file tools, ⌃ file actions by default; each key can be changed or turned off.
+public enum WheelMode: String, CaseIterable, Identifiable, Sendable {
+    case convert, tools, actions
+
+    public var id: String { rawValue }
+
+    /// UserDefaults key holding a `TriggerModifier` raw value, or "off".
+    /// Convert keeps the old single-wheel key so existing choices carry over.
+    public var settingsKey: String {
+        switch self {
+        case .convert: return ShellSettings.Key.triggerModifier
+        case .tools: return "wheelKey.tools"
+        case .actions: return "wheelKey.actions"
+        }
+    }
+
+    public var defaultModifier: TriggerModifier {
+        switch self {
+        case .convert: return .shift
+        case .tools: return .command
+        case .actions: return .control
+        }
+    }
+
+    public var title: String {
+        switch self {
+        case .convert: return "Convert formats"
+        case .tools: return "File tools"
+        case .actions: return "File actions"
+        }
+    }
+
+    public static let offValue = "off"
+
+    /// The key for this wheel, or nil when turned off. Unknown values fall back to the default.
+    public func modifier(in defaults: UserDefaults) -> TriggerModifier? {
+        let value = defaults.string(forKey: settingsKey)
+        if value == Self.offValue { return nil }
+        return value.flatMap(TriggerModifier.init(rawValue:)) ?? defaultModifier
+    }
+
+    /// Key → wheel for every wheel that's on. If two wheels share a key, the first one
+    /// (convert, tools, actions) wins, so a tap is never ambiguous.
+    public static func assignments(in defaults: UserDefaults) -> [(TriggerModifier, WheelMode)] {
+        var taken = Set<TriggerModifier>()
+        var result: [(TriggerModifier, WheelMode)] = []
+        for mode in allCases {
+            guard let key = mode.modifier(in: defaults), taken.insert(key).inserted else { continue }
+            result.append((key, mode))
+        }
+        return result
     }
 }

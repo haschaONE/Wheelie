@@ -51,32 +51,53 @@ private func settingsChanged() {
 
 private struct GeneralSettingsTab: View {
     @AppStorage(SettingsKey.wheelEnabled) private var wheelEnabled = true
-    @AppStorage(SettingsKey.triggerModifier) private var triggerModifier = TriggerModifier.shift.rawValue
+    @AppStorage(WheelMode.convert.settingsKey) private var convertKey = WheelMode.convert.defaultModifier.rawValue
+    @AppStorage(WheelMode.tools.settingsKey) private var toolsKey = WheelMode.tools.defaultModifier.rawValue
+    @AppStorage(WheelMode.actions.settingsKey) private var actionsKey = WheelMode.actions.defaultModifier.rawValue
     @AppStorage(SettingsKey.playSounds) private var playSounds = true
 
-    private var modifier: TriggerModifier { TriggerModifier(setting: triggerModifier) }
+    private func binding(_ mode: WheelMode) -> Binding<String> {
+        switch mode {
+        case .convert: return $convertKey
+        case .tools: return $toolsKey
+        case .actions: return $actionsKey
+        }
+    }
+
+    private var values: [String] { [convertKey, toolsKey, actionsKey] }
+
+    /// Two wheels on one key: the earlier one (formats, tools, actions) wins.
+    private var clash: Bool {
+        let on = values.filter { $0 != WheelMode.offValue }
+        return Set(on).count != on.count
+    }
 
     var body: some View {
         Form {
             Section {
-                Toggle("Modifier-drag opens the wheel", isOn: $wheelEnabled)
-                Picker("Trigger key", selection: $triggerModifier) {
-                    ForEach(TriggerModifier.allCases) { Text($0.label).tag($0.rawValue) }
+                Toggle("Wheels open while dragging", isOn: $wheelEnabled)
+                ForEach(WheelMode.allCases) { mode in
+                    Picker(mode.title, selection: binding(mode)) {
+                        ForEach(TriggerModifier.allCases) { Text($0.label).tag($0.rawValue) }
+                        Divider()
+                        Text("Off").tag(WheelMode.offValue)
+                    }
+                    .disabled(!wheelEnabled)
                 }
-                .disabled(!wheelEnabled)
             } header: {
-                Text("Wheel")
+                Text("Wheels")
             } footer: {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Start dragging files in Finder or any app, then hold \(modifier.label) to open the wheel under the pointer. Drop on a petal to convert or edit.")
-                    if modifier.affectsFinderDrops {
+                    Text("Start dragging files in Finder or any app, then tap a key: each key opens its own wheel under the pointer, and tapping another key switches wheels. The wheel stays open until you drop.")
+                    if clash {
                         Label {
-                            Text("While held, \(modifier.label) also changes what Finder does with a drop: Option copies instead of moving, Command moves instead of copying. If you let go outside the wheel, Finder uses that behaviour.")
+                            Text("Two wheels use the same key. Only the first of them (formats, then tools, then actions) opens.")
                         } icon: {
                             Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
                         }
-                    } else {
-                        Text("Shift and Control don't change what Finder does with a drop, so they're the safest choice.")
+                    }
+                    if values.contains(TriggerModifier.option.rawValue) {
+                        Text("Holding ⌥ Option during a Finder drag makes Finder copy instead of move; a quick tap doesn't.")
                     }
                 }
                 .font(.callout)
@@ -102,7 +123,9 @@ private struct GeneralSettingsTab: View {
         }
         .formStyle(.grouped)
         .onChange(of: wheelEnabled) { settingsChanged() }
-        .onChange(of: triggerModifier) { settingsChanged() }
+        .onChange(of: convertKey) { settingsChanged() }
+        .onChange(of: toolsKey) { settingsChanged() }
+        .onChange(of: actionsKey) { settingsChanged() }
         .onChange(of: playSounds) { settingsChanged() }
     }
 }

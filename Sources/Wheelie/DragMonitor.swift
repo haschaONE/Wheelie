@@ -1,5 +1,6 @@
 import AppKit
 import Carbon.HIToolbox
+import WheelieCore
 
 /// Detects file drags started in any app by polling global input state, the
 /// same approach Tangerine's DragGestureMonitor uses: no event taps, no
@@ -9,14 +10,16 @@ import Carbon.HIToolbox
 ///   count from *before* the mouse went down.
 /// - While the button is held it polls fast; a changed count with file URLs on
 ///   the drag pasteboard means a file drag is in progress.
-/// - The wheel triggers only once the trigger modifier (Shift) is held during
-///   that drag; it can be pressed at any point mid-drag.
+/// - A wheel opens when one of its keys is tapped during
+///   that drag; tapping another wheel's key switches wheels until the drop.
 @MainActor
 final class DragMonitor {
-    var onTrigger: ((_ files: [URL], _ at: NSPoint) -> Void)?
+    /// A wheel key was tapped during a file drag (or was already down when the drag began).
+    var onTrigger: ((_ mode: WheelMode, _ files: [URL], _ at: NSPoint) -> Void)?
     var onDragEnded: (() -> Void)?
     var onEscape: (() -> Void)?
-    var triggerModifier: NSEvent.ModifierFlags = .shift
+    /// Key → wheel, Tangerine-style (⇧ formats, ⌘ tools, ⌃ actions by default).
+    var triggers: [(NSEvent.ModifierFlags, WheelMode)] = [(.shift, .convert)]
 
     private let idleInterval: TimeInterval = 0.08
     private let activeInterval: TimeInterval = 1.0 / 60
@@ -27,6 +30,9 @@ final class DragMonitor {
     private var lastObservedChangeCount = NSPasteboard(name: .drag).changeCount
     private var changeCountBeforeMouseDown: Int?
     private var triggered = false
+    /// Files of the drag in progress, read once it's detected; nil while no file drag is active.
+    private var dragFiles: [URL]?
+    private var previousModifiers: NSEvent.ModifierFlags = []
 
     var isRunning: Bool { timer != nil }
 
@@ -73,20 +79,28 @@ final class DragMonitor {
             setActive(true)
         }
 
-        if buttonDown, !triggered, let baseline = changeCountBeforeMouseDown,
-           board.changeCount != baseline,
-           NSEvent.modifierFlags.contains(triggerModifier) {
+        let modifiers = NSEvent.modifierFlags.intersection([.shift, .control, .option, .command])
+        var dragJustStarted = false
+        if buttonDown, dragFiles == nil, let baseline = changeCountBeforeMouseDown, board.changeCount != baseline {
             let urls = (board.readObjects(forClasses: [NSURL.self],
                                           options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
-            if !urls.isEmpty {
+            if !urls.isEmpty { dragFiles = urls; dragJustStarted = true }
+        }
+        if buttonDown, let files = dragFiles {
+            // A tap = the key going down after the drag began. Keys already held then (⌘/⇧-click
+            // multi-selection in Finder) don't count until released and pressed again.
+            let pressed = dragJustStarted ? [] : modifiers.subtracting(previousModifiers)
+            if let (_, mode) = triggers.first(where: { pressed.contains($0.0) }) {
                 triggered = true
-                onTrigger?(urls, NSEvent.mouseLocation)
+                onTrigger?(mode, files, NSEvent.mouseLocation)
             }
         }
+        previousModifiers = modifiers
 
         if !buttonDown && wasPrimaryButtonDown {
             if triggered { onDragEnded?() }
             triggered = false
+            dragFiles = nil
             changeCountBeforeMouseDown = nil
             setActive(false)
         }

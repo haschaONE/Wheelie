@@ -23,6 +23,8 @@ final class WheelModel: ObservableObject {
         }
     }
     @Published var appeared = false
+    /// Which wheel is showing (shown under the file in the hub).
+    @Published var mode: WheelMode?
 
     /// Item picked by drop or click, with the files to use.
     var onChoose: ((WheelItem, [URL]) -> Void)?
@@ -40,14 +42,19 @@ enum WheelGeometry {
     static let size: CGFloat = 560
     static let hubSize: CGFloat = 104
     static let innerRadius: CGFloat = 118
+
+    /// Ring radius for `count` petals: 118 pt, growing so petals never overlap (≈14 fit in the panel).
+    static func innerRadius(count: Int) -> CGFloat {
+        max(innerRadius, CGFloat(count) * (innerPetal + 14) / (2 * .pi))
+    }
     static let innerPetal: CGFloat = 70
     static let outerRadius: CGFloat = 210
     static let outerPetal: CGFloat = 60
 
     /// Border between the inner and outer drop bands.
     static let ringBoundary: CGFloat = (innerRadius + innerPetal / 2 + outerRadius - outerPetal / 2) / 2
-    static func limit(hasOuter: Bool) -> CGFloat {
-        hasOuter ? outerRadius + outerPetal / 2 + 24 : innerRadius + innerPetal / 2 + 26
+    static func limit(hasOuter: Bool, innerCount: Int = 0) -> CGFloat {
+        hasOuter ? outerRadius + outerPetal / 2 + 24 : innerRadius(count: innerCount) + innerPetal / 2 + 26
     }
 
     /// Petal centre offset from the wheel centre, y pointing down (SwiftUI space). Index 0 is at the top.
@@ -66,7 +73,7 @@ enum WheelGeometry {
     /// Which (ring, index) a point targets; nil inside the hub (cancel zone) or outside the wheel.
     static func target(dx: CGFloat, dy: CGFloat, innerCount: Int, outerCount: Int) -> (WheelRing, Int)? {
         let distance = hypot(dx, dy)
-        guard distance > hubSize / 2, distance <= limit(hasOuter: outerCount > 0) else { return nil }
+        guard distance > hubSize / 2, distance <= limit(hasOuter: outerCount > 0, innerCount: innerCount) else { return nil }
         let useInner = innerCount > 0 && (outerCount == 0 || distance <= ringBoundary)
         if useInner { return (.inner, angularIndex(dx: dx, dy: dy, count: innerCount)) }
         guard outerCount > 0 else { return nil }
@@ -100,6 +107,18 @@ final class WheelPanel: NSPanel {
     }
 
     override var canBecomeKey: Bool { allowsKey }
+
+    /// In click mode (Open Files…) the panel is key, so wheel keys arrive as flagsChanged.
+    var onModifierTap: ((NSEvent.ModifierFlags) -> Void)?
+    private var lastFlags: NSEvent.ModifierFlags = []
+
+    override func flagsChanged(with event: NSEvent) {
+        let flags = event.modifierFlags.intersection([.shift, .control, .option, .command])
+        let pressed = flags.subtracting(lastFlags)
+        lastFlags = flags
+        if !pressed.isEmpty { onModifierTap?(pressed) }
+        super.flagsChanged(with: event)
+    }
 
     override func cancelOperation(_ sender: Any?) {
         dropView.model.onCancel?()
@@ -214,7 +233,7 @@ struct WheelView: View {
     static let accent = Color(red: 0.36, green: 0.42, blue: 1.0)
 
     var body: some View {
-        let limit = WheelGeometry.limit(hasOuter: !model.outer.isEmpty)
+        let limit = WheelGeometry.limit(hasOuter: !model.outer.isEmpty, innerCount: model.inner.count)
         ZStack {
             // Backdrop disk: also keeps the gaps between petals non-transparent,
             // so the window server routes drags there to us, not to the window below.
@@ -226,7 +245,7 @@ struct WheelView: View {
                 .opacity(model.appeared ? 1 : 0)
                 .animation(.easeOut(duration: 0.18), value: model.appeared)
 
-            ring(model.inner, radius: WheelGeometry.innerRadius, petal: WheelGeometry.innerPetal, delay: 0)
+            ring(model.inner, radius: WheelGeometry.innerRadius(count: model.inner.count), petal: WheelGeometry.innerPetal, delay: 0)
             ring(model.outer, radius: WheelGeometry.outerRadius, petal: WheelGeometry.outerPetal, delay: 0.08)
 
             HubView(model: model)
@@ -349,8 +368,9 @@ struct HubView: View {
 
     private var caption: String {
         if model.items.isEmpty { return "Nothing to do" }
-        return model.files.count == 1 ? (model.files[0].pathExtension.uppercased().nilIfEmpty ?? "Folder")
-                                      : "\(model.files.count) items"
+        let what = model.files.count == 1 ? (model.files[0].pathExtension.uppercased().nilIfEmpty ?? "Folder")
+                                          : "\(model.files.count) items"
+        return model.mode.map { "\(what)\n\($0.title)" } ?? what
     }
 }
 

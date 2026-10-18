@@ -509,3 +509,33 @@ final class ToneSynthTests: XCTestCase {
         XCTAssertEqual(SoundSpec(tones: [], peak: -1).peak, 0)
     }
 }
+
+final class WheelModeTests: XCTestCase {
+    private func defaults() -> UserDefaults {
+        let name = "wheelie-modes-\(UUID().uuidString)"
+        let d = UserDefaults(suiteName: name)!
+        d.removePersistentDomain(forName: name)
+        return d
+    }
+
+    func testTangerineDefaults() {
+        let d = defaults()
+        XCTAssertEqual(WheelMode.assignments(in: d).map { "\($0.0.rawValue)→\($0.1.rawValue)" },
+                       ["shift→convert", "command→tools", "control→actions"])
+    }
+
+    func testOffAndClashes() {
+        let d = defaults()
+        d.set(WheelMode.offValue, forKey: WheelMode.tools.settingsKey)
+        d.set("shift", forKey: WheelMode.actions.settingsKey)
+        // Tools off; actions clashes with convert's Shift, so convert keeps it.
+        XCTAssertEqual(WheelMode.assignments(in: d).map(\.1), [.convert])
+        XCTAssertNil(WheelMode.tools.modifier(in: d))
+        d.set("bogus", forKey: WheelMode.actions.settingsKey)
+        XCTAssertEqual(WheelMode.actions.modifier(in: d), .control)
+    }
+
+    func testConvertKeepsLegacyKey() {
+        XCTAssertEqual(WheelMode.convert.settingsKey, ShellSettings.Key.triggerModifier)
+    }
+}

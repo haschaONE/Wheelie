@@ -1,7 +1,8 @@
 import AppKit
 import WheelieCore
 
-/// Inner ring = output formats, outer ring = tools and file actions.
+/// Ring within a wheel. Each wheel (WheelMode) now shows a single ring, drawn as .inner;
+/// `ring` still tells formats (.inner) from tools/actions (.outer) when assigning wheels.
 enum WheelRing: Int, Comparable {
     case inner, outer
     static func < (a: WheelRing, b: WheelRing) -> Bool { a.rawValue < b.rawValue }
@@ -30,6 +31,20 @@ struct WheelItem: Identifiable {
     let accepts: @MainActor ([URL]) -> Bool
     /// Runs the item. Editors open their window and return `.none` right away.
     let perform: @MainActor ([URL]) async throws -> WheelOutcome
+}
+
+extension WheelItem {
+    /// Tangerine's file actions; everything else on the outer ring is a file tool.
+    static let actionIDs: Set<String> = [
+        "fileactions.airdrop", "float.add", "fileactions.copyFiles", "fileactions.move",
+        "fileactions.copyPath", "fileactions.terminal",
+    ]
+
+    /// Which wheel this item appears on: ⇧ formats, ⌘ tools, ⌃ actions (by default).
+    var mode: WheelMode {
+        if ring == .inner { return .convert }
+        return Self.actionIDs.contains(id) ? .actions : .tools
+    }
 }
 
 extension Collection where Element == URL {

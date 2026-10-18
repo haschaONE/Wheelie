@@ -1,4 +1,5 @@
 import AppKit
+import WheelieCore
 
 /// A self-contained feature. Each lives in `Sources/Wheelie/Features/<Name>/`.
 @MainActor
@@ -39,6 +40,15 @@ enum FeatureRegistry {
         features.flatMap { $0.wheelItems(for: files) }
             .filter { $0.accepts(files) }
             .sorted { ($0.ring, $0.order, $0.label) < ($1.ring, $1.order, $1.label) }
+    }
+
+    /// One wheel's petals, as a single ring.
+    static func items(for files: [URL], mode: WheelMode) -> [WheelItem] {
+        items(for: files).filter { $0.mode == mode }.map { item in
+            var single = item
+            single.ring = .inner
+            return single
+        }
     }
 
     static func startAll() { features.forEach { $0.start() } }

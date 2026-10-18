@@ -1,8 +1,17 @@
 # Wheelie
 
-Menu-bar file converter for macOS. Drag any file and hold **Shift** — a wheel of
-format targets spins up around the cursor. Drop on a petal to convert; the
-result lands next to the original (`photo.png` → `photo.jpg`, never overwriting).
+Menu-bar file converter for macOS. Start dragging any file, then tap a key — a
+wheel opens around the cursor (Tangerine-style):
+
+| Key | Wheel |
+|---|---|
+| ⇧ Shift | Convert formats |
+| ⌘ Command | File tools (compress, crop, trim, redact, …) |
+| ⌃ Control | File actions (AirDrop, Float, Copy, Move, Copy Path, Terminal) |
+
+Tap another key to switch wheels; the wheel stays open until you drop. Keys are
+changeable (or can be turned off) in Settings. Results land next to the original
+(`photo.png` → `photo.jpg`, never overwriting).
 
 | Input | Wheel offers |
 |---|---|

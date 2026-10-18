@@ -27,7 +27,7 @@ struct WelcomeIllustration: View {
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Animation: drag a file, hold \(modifier.name), and drop it on a petal of the wheel. The converted file appears next to the original.")
+        .accessibilityLabel("Animation: drag a file, tap \(modifier.name), and drop it on a petal of the wheel. The converted file appears next to the original.")
     }
 
     static func step(at t: Double) -> Int {
@@ -274,7 +274,7 @@ private struct MiniWheel: View {
     }
 }
 
-/// "1 Drag a file · 2 Hold ⇧ Shift · 3 Drop on a petal", following the animation.
+/// "1 Drag a file · 2 Tap ⇧ Shift · 3 Drop on a petal", following the animation.
 private struct WelcomeSteps: View {
     let active: Int?
     let modifier: TriggerModifier
@@ -283,7 +283,7 @@ private struct WelcomeSteps: View {
         HStack(spacing: 8) {
             step(0, "Drag a file")
             chevron
-            step(1, "Hold \(modifier.label)")
+            step(1, "Tap \(modifier.label)")
             chevron
             step(2, "Drop on a petal")
         }

@@ -111,7 +111,7 @@ struct WelcomeView: View {
             VStack(spacing: 6) {
                 Text("Welcome to Wheelie")
                     .font(.system(size: 26, weight: .bold, design: .rounded))
-                Text("Drag a file, hold \(modifier.label), and drop it on the wheel to convert or edit it — right where you are.")
+                Text("Start dragging a file, tap \(modifier.label) for formats (⌘ for tools, ⌃ for actions), and drop it on the wheel — right where you are.")
                     .multilineTextAlignment(.center)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

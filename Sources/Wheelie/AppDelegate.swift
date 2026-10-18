@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The job the wheel is currently showing progress for. A job only reports into the
     /// hub while it still owns it, so an older job can't claim a newer one's "working" state.
     private var wheelJob: UUID?
+    private var wheelCenter = NSPoint.zero
     private var observers: [AnyCancellable] = []
 
     private var wheelEnabled: Bool {
@@ -33,12 +34,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.onChoose = { [weak self] item, files in self?.perform(item, files: files) }
         model.onCancel = { [weak self] in self?.hideWheel() }
 
-        // Modifier held while dragging files -> wheel opens under the cursor.
-        dragMonitor.onTrigger = { [weak self] files, point in
+        // Tap a wheel's key while dragging files -> that wheel opens under the cursor;
+        // tapping another wheel's key switches in place until the drop.
+        dragMonitor.onTrigger = { [weak self] mode, files, point in
             guard let self, !self.panel.isVisible || self.model.phase == .choosing else { return }
-            let items = FeatureRegistry.items(for: files)
-            guard !items.isEmpty else { return }
-            self.showWheel(files: files, items: items, at: point, interactive: false)
+            self.open(mode, files: files, at: self.panel.isVisible ? self.wheelCenter : point, interactive: false)
+        }
+        panel.onModifierTap = { [weak self] flags in
+            guard let self, self.panel.allowsKey, self.model.phase == .choosing,
+                  let mode = self.dragMonitor.triggers.first(where: { flags.contains($0.0) })?.1 else { return }
+            self.open(mode, files: self.model.files, at: self.wheelCenter, interactive: true)
         }
         dragMonitor.onDragEnded = { [weak self] in
             // A drop on the wheel lands just after mouse-up; give it a moment.
@@ -62,30 +67,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // Debug aid: `Wheelie --show-wheel <file>...` opens the wheel immediately.
         let args = CommandLine.arguments
+        // `--show-wheel [--mode convert|tools|actions] <file>...`
         if let i = args.firstIndex(of: "--show-wheel"), args.count > i + 1 {
-            let files = args[(i + 1)...].map { URL(fileURLWithPath: $0) }
+            var rest = Array(args[(i + 1)...])
+            var mode = WheelMode.convert
+            if rest.first == "--mode", rest.count > 2, let m = WheelMode(rawValue: rest[1]) { mode = m; rest.removeFirst(2) }
+            let files = rest.map { URL(fileURLWithPath: $0) }
             let frame = NSScreen.main?.frame ?? .zero
-            showWheel(files: files, items: FeatureRegistry.items(for: files),
-                      at: NSPoint(x: frame.midX, y: frame.midY), interactive: true)
+            open(mode, files: files, at: NSPoint(x: frame.midX, y: frame.midY), interactive: true, force: true)
         }
     }
 
     private func applySettings() {
         services.applySettings()
-        let modifier: NSEvent.ModifierFlags
-        switch UserDefaults.standard.string(forKey: SettingsKey.triggerModifier) ?? "shift" {
-        case "control": modifier = .control
-        case "option": modifier = .option
-        case "command": modifier = .command
-        default: modifier = .shift
-        }
-        dragMonitor.triggerModifier = modifier
+        dragMonitor.triggers = WheelMode.assignments(in: .standard).map { (Self.flags(for: $0.0), $0.1) }
         if wheelEnabled != dragMonitor.isRunning {
             wheelEnabled ? dragMonitor.start() : dragMonitor.stop()
         }
     }
 
     // MARK: Wheel
+
+    static func flags(for modifier: TriggerModifier) -> NSEvent.ModifierFlags {
+        switch modifier {
+        case .shift: return .shift
+        case .control: return .control
+        case .option: return .option
+        case .command: return .command
+        }
+    }
+
+    /// Opens (or switches to) one wheel. A wheel with nothing for these files is skipped,
+    /// unless `force` (debug/open-files) asks to show it anyway.
+    private func open(_ mode: WheelMode, files: [URL], at point: NSPoint, interactive: Bool, force: Bool = false) {
+        let items = FeatureRegistry.items(for: files, mode: mode)
+        guard !items.isEmpty || force else { return }
+        if panel.isVisible, model.mode == mode, model.files == files { return }
+        model.mode = mode
+        showWheel(files: files, items: items, at: point, interactive: interactive)
+    }
 
     private func showWheel(files: [URL], items: [WheelItem], at point: NSPoint, interactive: Bool) {
         hideWork?.cancel()
@@ -96,6 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.phase = .choosing
         model.appeared = false
         panel.allowsKey = interactive
+        wheelCenter = point
         panel.center(on: point)
         if interactive {
             NSApp.activate(ignoringOtherApps: true)
@@ -157,7 +178,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         open.message = "Choose files to convert or edit"
         NSApp.activate(ignoringOtherApps: true)
         guard open.runModal() == .OK, !open.urls.isEmpty else { return }
-        showWheel(files: open.urls, items: FeatureRegistry.items(for: open.urls), at: NSEvent.mouseLocation, interactive: true)
+        // Start on the first wheel that has something for these files; tap ⇧/⌘/⌃ to switch.
+        let mode = WheelMode.allCases.first { !FeatureRegistry.items(for: open.urls, mode: $0).isEmpty } ?? .convert
+        self.open(mode, files: open.urls, at: NSEvent.mouseLocation, interactive: true, force: true)
     }
 
     // MARK: Menu
@@ -172,23 +195,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.button?.toolTip = busy ? "Wheelie — \(services.activeJobs) running…" : "Wheelie"
     }
 
-    private var modifierName: String {
-        switch UserDefaults.standard.string(forKey: SettingsKey.triggerModifier) ?? "shift" {
-        case "control": return "⌃ Control"
-        case "option": return "⌥ Option"
-        case "command": return "⌘ Command"
-        default: return "⇧ Shift"
-        }
-    }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         let header = NSMenuItem(title: "Wheelie", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
-        let hint = NSMenuItem(title: "Hold \(modifierName) while dragging a file to open the wheel", action: nil, keyEquivalent: "")
+        let hint = NSMenuItem(title: "Start dragging a file, then tap:", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
+        for (key, mode) in WheelMode.assignments(in: .standard) {
+            let line = NSMenuItem(title: "   \(key.label) — \(mode.title)", action: nil, keyEquivalent: "")
+            line.isEnabled = false
+            menu.addItem(line)
+        }
         menu.addItem(.separator())
 
         menu.addItem(item("Open Files…", #selector(openFiles), key: "o"))
