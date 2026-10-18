@@ -11,6 +11,8 @@ final class PDFCreateModel: ObservableObject {
         let url: URL
         var size: CGSize?
         var thumbnail: CGImage?
+        /// Pages it makes (a multi-page TIFF makes one per page).
+        var pages = 1
         var name: String { url.lastPathComponent }
     }
 
@@ -43,6 +45,7 @@ final class PDFCreateModel: ObservableObject {
                 }
                 items[index].size = summary.size
                 items[index].thumbnail = summary.thumbnail
+                items[index].pages = summary.pages
             }
         }
     }
@@ -50,6 +53,9 @@ final class PDFCreateModel: ObservableObject {
     func close() { AppServices.shared.closeWindow(id: windowID) }
 
     var selectedItem: Item? { items.first { $0.id == selection } ?? items.first }
+
+    /// Pages in the PDF: one per image, one per page of a multi-page TIFF.
+    var pageCount: Int { items.reduce(0) { $0 + $1.pages } }
 
     func move(from source: IndexSet, to destination: Int) { items.move(fromOffsets: source, toOffset: destination) }
 
@@ -139,7 +145,8 @@ struct PDFCreateView: View {
                         VStack(alignment: .leading, spacing: 1) {
                             Text(item.name).lineLimit(1).truncationMode(.middle)
                             if let size = item.size {
-                                Text("\(Int(size.width)) × \(Int(size.height))").font(.caption).foregroundStyle(.secondary)
+                                Text("\(Int(size.width)) × \(Int(size.height))" + (item.pages > 1 ? " · \(item.pages) pages" : ""))
+                                    .font(.caption).foregroundStyle(.secondary)
                             }
                         }
                     }
@@ -202,9 +209,12 @@ struct PDFCreateView: View {
     }
 
     private func caption(page: CGSize) -> String {
-        let index = (model.items.firstIndex { $0.id == model.selectedItem?.id } ?? 0) + 1
+        let position = model.items.firstIndex { $0.id == model.selectedItem?.id } ?? 0
+        let first = model.items.prefix(position).reduce(0) { $0 + $1.pages } + 1
+        let pages = model.selectedItem?.pages ?? 1
         let inches = String(format: "%.2f × %.2f in", page.width / 72, page.height / 72)
-        return "Page \(index) of \(model.items.count) · \(inches)"
+        let which = pages > 1 ? "Pages \(first)–\(first + pages - 1)" : "Page \(first)"
+        return "\(which) of \(model.pageCount) · \(inches)"
     }
 
     private var settings: some View {
@@ -245,7 +255,7 @@ struct PDFCreateView: View {
 
     private var footer: some View {
         HStack(spacing: 12) {
-            Text(model.items.count == 1 ? "1 page" : "\(model.items.count) pages")
+            Text(model.pageCount == 1 ? "1 page" : "\(model.pageCount) pages")
                 .font(.callout).foregroundStyle(.secondary)
             Spacer()
             InlineError(message: model.error)

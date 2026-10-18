@@ -40,25 +40,24 @@ public enum PDFOrganizer {
         guard let first = nameSource ?? files.first else { throw PDFToolsError.noPages }
         let sources = try files.map(PDFSourceLoader.document(for:))
         let document = try makeDocument(sources: sources, plan: plan, equalizeWidths: equalizeWidths)
-        let output = destination ?? OutputNaming.uniqueURL(for: first, ext: "pdf", suffix: " organized")
-        try write(document, to: output, expectedPages: plan.count,
-                  writeError: "PDFKit could not write the organized PDF.",
-                  verifyError: "The organized PDF could not be verified.")
+        let output = try write(document, to: { destination ?? OutputNaming.uniqueURL(for: first, ext: "pdf", suffix: " organized") },
+                               expectedPages: plan.count,
+                               writeError: "PDFKit could not write the organized PDF.",
+                               verifyError: "The organized PDF could not be verified.")
         withExtendedLifetime(sources) {}
         return output
     }
 
-    /// Writes a document and re-opens it to make sure all pages made it. Removes the file on failure.
-    static func write(_ document: PDFDocument, to url: URL, expectedPages: Int,
-                      writeError: String, verifyError: String) throws {
-        guard document.write(to: url) else {
-            try? FileManager.default.removeItem(at: url)
-            throw PDFToolsError(writeError)
-        }
-        guard let check = PDFDocument(url: url), check.pageCount == expectedPages else {
-            try? FileManager.default.removeItem(at: url)
-            throw PDFToolsError(verifyError)
-        }
+    /// Writes a document in a staging folder, re-opens it to make sure all pages made it,
+    /// and only then moves it to `destination()` (asked again if that name got taken
+    /// meanwhile). Nothing is left behind on failure. Returns the final URL.
+    static func write(_ document: PDFDocument, to destination: () -> URL, expectedPages: Int,
+                      writeError: String, verifyError: String) throws -> URL {
+        let staging = try StagedOutput(near: destination())
+        let temp = staging.file("output.pdf")
+        guard document.write(to: temp) else { throw PDFToolsError(writeError) }
+        guard PDFDocument(url: temp)?.pageCount == expectedPages else { throw PDFToolsError(verifyError) }
+        return try staging.commit(temp, to: destination)
     }
 
     /// Redraws a page (rotation baked in) into a new page `scale` times its displayed size.
@@ -104,10 +103,10 @@ public enum PDFMerger {
         let counts = sources.map(\.pageCount)
         guard counts.contains(where: { $0 > 0 }) else { throw PDFToolsError.noPages }
         let document = try PDFOrganizer.makeDocument(sources: sources, plan: .identity(pageCounts: counts))
-        let output = destination ?? OutputNaming.uniqueURL(for: first, ext: "pdf", suffix: " combined")
-        try PDFOrganizer.write(document, to: output, expectedPages: counts.reduce(0, +),
-                               writeError: "PDFKit could not write the combined PDF.",
-                               verifyError: "The combined PDF could not be verified.")
+        let output = try PDFOrganizer.write(document, to: { destination ?? OutputNaming.uniqueURL(for: first, ext: "pdf", suffix: " combined") },
+                                            expectedPages: counts.reduce(0, +),
+                                            writeError: "PDFKit could not write the combined PDF.",
+                                            verifyError: "The combined PDF could not be verified.")
         withExtendedLifetime(sources) {}
         return output
     }

@@ -357,9 +357,227 @@ final class TextRecognitionTests: XCTestCase {
         XCTAssertThrowsError(try SearchablePDF.process(blank, options: TextRecognitionOptions()))
         XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("blank searchable.pdf").path))
     }
+
+    /// Regression: Recognize used to redraw every page into a fresh PDF, dropping links,
+    /// bookmarks, form fields and the title/author, even on pages it "kept as they are".
+    func testSearchablePDFKeepsLinksBookmarksFormsAndMetadata() throws {
+        let dir = try pdfTempDir()
+        let raw = dir.appendingPathComponent("raw.pdf")
+        try makeMixedPDF(at: raw, scanText: Self.phrase, typedText: "Already searchable")
+        let doc = try XCTUnwrap(PDFDocument(url: raw))
+        let scanPage = try XCTUnwrap(doc.page(at: 0)), typedPage = try XCTUnwrap(doc.page(at: 1))
+        let web = PDFAnnotation(bounds: CGRect(x: 20, y: 20, width: 120, height: 20), forType: .link, withProperties: nil)
+        web.url = URL(string: "https://example.com/scan")
+        scanPage.addAnnotation(web)
+        let field = PDFAnnotation(bounds: CGRect(x: 20, y: 100, width: 200, height: 24), forType: .widget, withProperties: nil)
+        field.widgetFieldType = .text
+        field.fieldName = "Signature"
+        field.widgetStringValue = "Ada"
+        scanPage.addAnnotation(field)
+        let back = PDFAnnotation(bounds: CGRect(x: 20, y: 20, width: 120, height: 20), forType: .link, withProperties: nil)
+        back.action = PDFActionGoTo(destination: PDFDestination(page: scanPage, at: CGPoint(x: 0, y: 792)))
+        typedPage.addAnnotation(back)
+        let root = PDFOutline()
+        for (index, (label, page)) in [("Scan", scanPage), ("Typed", typedPage)].enumerated() {
+            let item = PDFOutline()
+            item.label = label
+            item.destination = PDFDestination(page: page, at: CGPoint(x: 0, y: 792))
+            root.insertChild(item, at: index)
+        }
+        doc.outlineRoot = root
+        doc.documentAttributes = [PDFDocumentAttribute.titleAttribute: "Quarterly Report",
+                                  PDFDocumentAttribute.authorAttribute: "Ada"]
+        let source = dir.appendingPathComponent("report.pdf")
+        XCTAssertTrue(doc.write(to: source))
+        let before = try Data(contentsOf: source)
+
+        // While it runs, nothing appears under the final name (no half-written file).
+        let final = dir.appendingPathComponent("report searchable.pdf")
+        var sawPartial = false
+        let outputs = try SearchablePDF.process(source, options: TextRecognitionOptions()) { _, _ in
+            if FileManager.default.fileExists(atPath: final.path) { sawPartial = true }
+        }
+        XCTAssertFalse(sawPartial, "the output must only appear once complete")
+        XCTAssertEqual(outputs.map(\.lastPathComponent), ["report searchable.pdf"])
+        XCTAssertEqual(try Data(contentsOf: source), before, "the original is never touched")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path).sorted(),
+                       ["raw.pdf", "report searchable.pdf", "report.pdf"], "no staging leftovers")
+
+        let out = try XCTUnwrap(PDFDocument(url: outputs[0]))
+        XCTAssertEqual(out.pageCount, 2)
+        let page0 = try XCTUnwrap(out.page(at: 0)), page1 = try XCTUnwrap(out.page(at: 1))
+        XCTAssertTrue(page0.string?.contains(Self.phrase) == true, page0.string ?? "")
+        XCTAssertTrue(page1.string?.contains("Already searchable") == true)
+        XCTAssertEqual(page0.bounds(for: .mediaBox), CGRect(x: 0, y: 0, width: 612, height: 792))
+
+        let attributes = out.documentAttributes ?? [:]
+        XCTAssertEqual(attributes[PDFDocumentAttribute.titleAttribute] as? String, "Quarterly Report")
+        XCTAssertEqual(attributes[PDFDocumentAttribute.authorAttribute] as? String, "Ada")
+
+        let outline = try XCTUnwrap(out.outlineRoot)
+        XCTAssertEqual(outline.numberOfChildren, 2)
+        XCTAssertEqual(outline.child(at: 0)?.label, "Scan")
+        XCTAssertEqual(outline.child(at: 0)?.destination?.page.map(out.index(for:)), 0, "bookmark follows the replaced page")
+        XCTAssertEqual(outline.child(at: 1)?.destination?.page.map(out.index(for:)), 1)
+
+        // The recognized page keeps its link and its live form field.
+        let link = page0.annotations.first { $0.url != nil }
+        XCTAssertEqual(link?.url?.absoluteString, "https://example.com/scan")
+        let widget = page0.annotations.first { $0.fieldName == "Signature" }
+        XCTAssertEqual(widget?.widgetFieldType, .text)
+        XCTAssertEqual(widget?.widgetStringValue, "Ada")
+        // The kept page keeps its link, which still lands on the (replaced) first page.
+        let goTo = page1.annotations.compactMap { $0.action as? PDFActionGoTo }.first
+        XCTAssertEqual(goTo?.destination.page.map(out.index(for:)), 0)
+    }
+
+    /// The text layer of a rotated scan lines up with the text as displayed.
+    func testRotatedScanGetsTextWhereItIsShown() throws {
+        let dir = try pdfTempDir()
+        let scan = dir.appendingPathComponent("turned.pdf")
+        try makeRotatedScan(at: scan, text: Self.phrase)
+        let outputs = try SearchablePDF.process(scan, options: TextRecognitionOptions(languages: ["en-US"]))
+        let doc = try XCTUnwrap(PDFDocument(url: outputs[0]))
+        let page = try XCTUnwrap(doc.page(at: 0))
+        XCTAssertEqual(page.rotation, 90, "rotation is kept, not baked in")
+        XCTAssertEqual(page.bounds(for: .mediaBox).size, CGSize(width: 612, height: 792))
+        let selection = try XCTUnwrap(doc.findString(Self.phrase, withOptions: []).first)
+        let bounds = selection.bounds(for: page)
+        // Shown in the top half of the turned page = the left half of the unturned page,
+        // running up the page.
+        XCTAssertLessThan(bounds.maxX, 306, "\(bounds)")
+        XCTAssertGreaterThan(bounds.height, bounds.width, "\(bounds)")
+    }
+}
+
+final class MultiPageImageTests: XCTestCase {
+    /// Regression: only the first page of a multi-page TIFF (scans, faxes) was used.
+    func testEveryTIFFPageBecomesAPage() throws {
+        let dir = try pdfTempDir()
+        let tiff = dir.appendingPathComponent("fax.tiff")
+        try makeMultiImage(at: tiff, type: .tiff, sizes: [(300, 400), (310, 410), (320, 420)])
+        let png = dir.appendingPathComponent("photo.png")
+        try makeImage(at: png, width: 64, height: 48)
+
+        XCTAssertEqual(PDFSourceLoader.pageCount(of: tiff), 3)
+        XCTAssertEqual(PDFSourceLoader.imageSummary(tiff, thumbnailPixels: 64)?.pages, 3)
+        XCTAssertEqual(try PDFSourceLoader.document(for: tiff).pageCount, 3)
+
+        let made = try ImagesToPDF.create([tiff, png], options: ImagePDFOptions())
+        let doc = try XCTUnwrap(PDFDocument(url: made))
+        XCTAssertEqual((0..<doc.pageCount).map { doc.page(at: $0)!.bounds(for: .mediaBox).size },
+                       [CGSize(width: 300, height: 400), CGSize(width: 310, height: 410),
+                        CGSize(width: 320, height: 420), CGSize(width: 64, height: 48)])
+
+        let combined = try PDFMerger.combine([tiff, png])
+        XCTAssertEqual(PDFDocument(url: combined)?.pageCount, 4)
+    }
+
+    /// Animation frames are not pages: an animated GIF is still one page.
+    func testAnimatedImageUsesItsFirstFrame() throws {
+        let dir = try pdfTempDir()
+        let gif = dir.appendingPathComponent("spinner.gif")
+        try makeMultiImage(at: gif, type: .gif, sizes: [(40, 30), (40, 30), (40, 30)])
+        XCTAssertEqual(PDFSourceLoader.pageCount(of: gif), 1)
+        XCTAssertEqual(try PDFSourceLoader.document(for: gif).pageCount, 1)
+        let made = try ImagesToPDF.create([gif], options: ImagePDFOptions())
+        XCTAssertEqual(PDFDocument(url: made)?.pageCount, 1)
+    }
+}
+
+final class StagedOutputTests: XCTestCase {
+    func testCommitMovesIntoPlaceWithoutOverwriting() throws {
+        let dir = try pdfTempDir()
+        let taken = dir.appendingPathComponent("a.pdf")
+        try Data("original".utf8).write(to: taken)
+
+        let staging = try StagedOutput(near: taken)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), ["a.pdf"],
+                       "work in progress is not visible next to the output")
+        let file = staging.file("output.pdf")
+        try Data("new".utf8).write(to: file)
+
+        // The name was taken after it was picked: the next free name is asked for.
+        var calls = 0
+        let result = try staging.commit(file) {
+            calls += 1
+            return calls == 1 ? taken : OutputNaming.uniqueURL(for: taken, ext: "pdf")
+        }
+        XCTAssertEqual(result.lastPathComponent, "a 2.pdf")
+        XCTAssertEqual(try String(contentsOf: taken, encoding: .utf8), "original")
+        XCTAssertEqual(try String(contentsOf: result, encoding: .utf8), "new")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staging.directory.path))
+    }
+
+    func testDiscardLeavesNothingBehind() throws {
+        let dir = try pdfTempDir()
+        var staging: StagedOutput? = try StagedOutput(near: dir.appendingPathComponent("b.pdf"))
+        let folder = try XCTUnwrap(staging?.directory)
+        try Data("partial".utf8).write(to: folder.appendingPathComponent("output.pdf"))
+        staging = nil   // e.g. an error was thrown mid-write
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), [])
+
+        // A failed Make PDF leaves no output either.
+        XCTAssertThrowsError(try ImagesToPDF.create([dir.appendingPathComponent("missing.png")], options: ImagePDFOptions()))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), [])
+    }
 }
 
 // MARK: - Fixtures
+
+/// Page 1: a scan (image only) of `scanText`; page 2: real, selectable `typedText`.
+private func makeMixedPDF(at url: URL, scanText: String, typedText: String) throws {
+    let ctx = try XCTUnwrap(CGContext(url as CFURL, mediaBox: nil, nil))
+    let page = CGRect(x: 0, y: 0, width: 612, height: 792)
+    var box = page
+    let info = [kCGPDFContextMediaBox as String: Data(bytes: &box, count: MemoryLayout<CGRect>.size) as CFData] as CFDictionary
+    ctx.beginPDFPage(info)
+    ctx.setFillColor(.white)
+    ctx.fill(page)
+    ctx.draw(textImage(scanText, width: 1224, height: 400), in: CGRect(x: 0, y: 492, width: 612, height: 200))
+    ctx.endPDFPage()
+    ctx.beginPDFPage(info)
+    let font = CTFontCreateWithName("Helvetica" as CFString, 24, nil)
+    let line = CTLineCreateWithAttributedString(NSAttributedString(string: typedText, attributes: [.init(kCTFontAttributeName as String): font]))
+    ctx.textPosition = CGPoint(x: 40, y: 600)
+    CTLineDraw(line, ctx)
+    ctx.endPDFPage()
+    ctx.closePDF()
+}
+
+/// A portrait page with /Rotate 90 whose scanned text reads upright as displayed
+/// (landscape), in the top half of the displayed page.
+private func makeRotatedScan(at url: URL, text: String) throws {
+    let ctx = try XCTUnwrap(CGContext(url as CFURL, mediaBox: nil, nil))
+    var box = CGRect(x: 0, y: 0, width: 612, height: 792)
+    let info = [kCGPDFContextMediaBox as String: Data(bytes: &box, count: MemoryLayout<CGRect>.size) as CFData] as CFDictionary
+    ctx.beginPDFPage(info)
+    ctx.setFillColor(.white)
+    ctx.fill(box)
+    // Displayed (x, y) → page (612 - y, x): what a 90° clockwise display turn undoes.
+    ctx.concatenate(CGAffineTransform(a: 0, b: 1, c: -1, d: 0, tx: 612, ty: 0))
+    ctx.draw(textImage(text, width: 1224, height: 400), in: CGRect(x: 40, y: 380, width: 612, height: 200))
+    ctx.endPDFPage()
+    ctx.closePDF()
+    let doc = try XCTUnwrap(PDFDocument(url: url))
+    doc.page(at: 0)?.rotation = 90
+    XCTAssertTrue(doc.write(to: url))
+}
+
+/// One image per size in a single file (TIFF pages, GIF frames).
+private func makeMultiImage(at url: URL, type: UTType, sizes: [(Int, Int)]) throws {
+    let dest = try XCTUnwrap(CGImageDestinationCreateWithURL(url as CFURL, type.identifier as CFString, sizes.count, nil))
+    for (width, height) in sizes {
+        let ctx = try XCTUnwrap(CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                          bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+        ctx.setFillColor(CGColor(red: 0.2, green: 0.4, blue: 0.9, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        CGImageDestinationAddImage(dest, try XCTUnwrap(ctx.makeImage()), nil)
+    }
+    XCTAssertTrue(CGImageDestinationFinalize(dest))
+}
 
 private func pdfTempDir() throws -> URL {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent("wheelie-pdf-tests-\(UUID().uuidString)")

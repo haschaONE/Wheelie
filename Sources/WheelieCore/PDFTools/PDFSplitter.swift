@@ -125,11 +125,11 @@ public enum PDFSplitter {
                     part.insert(page, at: part.pageCount)
                 }
                 if let attributes = doc.documentAttributes { part.documentAttributes = attributes }
-                let output = OutputNaming.uniqueURL(for: url, ext: "pdf", suffix: suffix(for: group), in: folder)
-                try PDFOrganizer.write(part, to: output, expectedPages: group.count,
-                                       writeError: "PDFKit could not write “\(output.lastPathComponent)”.",
-                                       verifyError: "“\(output.lastPathComponent)” could not be verified.")
-                written.append(output)
+                let name = { OutputNaming.uniqueURL(for: url, ext: "pdf", suffix: suffix(for: group), in: folder) }
+                let shown = name().lastPathComponent
+                written.append(try PDFOrganizer.write(part, to: name, expectedPages: group.count,
+                                                      writeError: "PDFKit could not write “\(shown)”.",
+                                                      verifyError: "“\(shown)” could not be verified."))
             }
         } catch {
             written.forEach { try? fm.removeItem(at: $0) }

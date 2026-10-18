@@ -329,6 +329,7 @@ struct PDFOrganizeView: View {
         return OrganizePageCell(page: page, position: position, image: thumbnails.images[page.key],
                                 fileName: fileName, selected: model.selection.contains(page.id),
                                 side: model.zoom, onRotate: { model.rotate(page.id) })
+            .showsThumbnail(page.key, from: thumbnails)
             .onTapGesture { model.click(page.id) }
             .onDrag {
                 model.beginDrag(page.id)

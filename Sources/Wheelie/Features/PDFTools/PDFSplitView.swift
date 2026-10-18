@@ -76,6 +76,9 @@ final class PDFSplitModel: ObservableObject {
 
     var groups: Result<[[Int]], Error> {
         guard pageCount > 0 else { return .failure(PDFToolsError.noPages) }
+        guard pageCount > 1 else {
+            return .failure(PDFToolsError("“\(url.lastPathComponent)” has only one page, so there is nothing to split."))
+        }
         return splitMode.flatMap { mode in Result { try PDFSplitter.groups(for: mode, pageCount: pageCount) } }
     }
 
@@ -230,6 +233,7 @@ struct PDFSplitView: View {
                                   checkable: model.mode == .selected,
                                   checked: model.selectedPages.contains(page),
                                   fileNumbers: model.mode == .selected ? [] : numbers[page] ?? [])
+                        .showsThumbnail(PageKey(file: 0, page: page), from: thumbnails)
                         .onTapGesture { if model.mode == .selected { model.toggle(page) } }
                 }
             }

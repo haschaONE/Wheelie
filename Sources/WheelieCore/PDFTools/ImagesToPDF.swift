@@ -101,26 +101,25 @@ public struct ImagePDFOptions: Equatable, Sendable {
     }
 }
 
-/// "Make PDF": several images into one PDF, one page each.
+/// "Make PDF": several images into one PDF, one page per image (and one per page of a
+/// multi-page TIFF).
 public enum ImagesToPDF {
-    /// Writes "<first name>.pdf" (unique) and returns it.
+    /// Writes "<first name>.pdf" (unique) and returns it. The PDF is built in a staging
+    /// folder and only appears under its name once it is complete and verified.
     @discardableResult
     public static func create(_ images: [URL], options: ImagePDFOptions, to destination: URL? = nil) throws -> URL {
         guard let first = images.first else { throw PDFToolsError("Add at least one image.") }
-        let output = destination ?? OutputNaming.uniqueURL(for: first, ext: "pdf")
-        do {
-            try write(images, options: options, to: output)
-            guard let check = PDFDocument(url: output), check.pageCount == images.count else {
-                throw PDFToolsError("The generated PDF could not be verified.")
-            }
-        } catch {
-            try? FileManager.default.removeItem(at: output)
-            throw error
+        let name = { destination ?? OutputNaming.uniqueURL(for: first, ext: "pdf") }
+        let staging = try StagedOutput(near: name())
+        let temp = staging.file("output.pdf")
+        let pages = try write(images, options: options, to: temp)
+        guard PDFDocument(url: temp)?.pageCount == pages else {
+            throw PDFToolsError("The generated PDF could not be verified.")
         }
-        return output
+        return try staging.commit(temp, to: name)
     }
 
-    /// The PDF as data (used to treat an image as a one-page PDF).
+    /// The PDF as data (used to treat an image as a PDF).
     public static func data(from images: [URL], options: ImagePDFOptions) throws -> Data {
         let data = NSMutableData()
         guard let consumer = CGDataConsumer(data: data), let ctx = CGContext(consumer: consumer, mediaBox: nil, nil)
@@ -129,24 +128,34 @@ public enum ImagesToPDF {
         return data as Data
     }
 
-    static func write(_ images: [URL], options: ImagePDFOptions, to url: URL) throws {
+    /// Returns the number of pages written.
+    static func write(_ images: [URL], options: ImagePDFOptions, to url: URL) throws -> Int {
         guard let ctx = CGContext(url as CFURL, mediaBox: nil, nil) else { throw PDFToolsError("Could not create the PDF.") }
-        try draw(images, options: options, into: ctx)
+        return try draw(images, options: options, into: ctx)
     }
 
-    private static func draw(_ images: [URL], options: ImagePDFOptions, into ctx: CGContext) throws {
+    @discardableResult
+    private static func draw(_ images: [URL], options: ImagePDFOptions, into ctx: CGContext) throws -> Int {
         defer { ctx.closePDF() }
+        var pages = 0
         for url in images {
-            let image = try EmbeddableImage.load(url)
-            let size = image.orientedSize
-            let page = options.pageSize(for: size)
-            let box = CGRect(origin: .zero, size: page)
-            ctx.beginPDFPage(PDFPageGeometry.pageInfo(mediaBox: box))
-            ctx.saveGState()
-            ctx.clip(to: options.contentRect(on: page))
-            image.draw(in: options.imageRect(for: size, on: page), context: ctx)
-            ctx.restoreGState()
-            ctx.endPDFPage()
+            let source = try EmbeddableImage.source(for: url)
+            for index in 0..<EmbeddableImage.pageCount(of: source) {
+                try autoreleasepool {
+                    let image = try EmbeddableImage.load(source, at: index, url: url)
+                    let size = image.orientedSize
+                    let page = options.pageSize(for: size)
+                    let box = CGRect(origin: .zero, size: page)
+                    ctx.beginPDFPage(PDFPageGeometry.pageInfo(mediaBox: box))
+                    ctx.saveGState()
+                    ctx.clip(to: options.contentRect(on: page))
+                    image.draw(in: options.imageRect(for: size, on: page), context: ctx)
+                    ctx.restoreGState()
+                    ctx.endPDFPage()
+                }
+                pages += 1
+            }
         }
+        return pages
     }
 }
