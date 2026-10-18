@@ -240,6 +240,28 @@ final class DocumentRobustnessTests: XCTestCase {
         XCTAssertEqual(try XLSX.read(letters).first?.rows, [["", "2"]])
     }
 
+    func testHugeRowNumbersDoNotOverflow() throws {
+        let dir = try tempDir()
+        let url = dir.appendingPathComponent("rows.xlsx")
+        // r = Int.max, then rows without r (would be Int.max + 1), then a normal one.
+        try workbook(sheetData: """
+        <row r="9223372036854775807"><c><v>1</v></c></row><row><c><v>2</v></c></row>\
+        <row><c><v>3</v></c></row><row r="2"><c r="A2"><v>4</v></c></row>
+        """).write(to: url)
+        let sheet = try XCTUnwrap(XLSX.read(url).first)
+        XCTAssertEqual(sheet.rows, [[], ["4"]])
+    }
+
+    func testRepeatedCellReferencesCannotGrowARow() throws {
+        let dir = try tempDir()
+        let url = dir.appendingPathComponent("repeat.xlsx")
+        // 200k cells all claiming A1: before the fix each was appended to the row.
+        let cells = String(repeating: "<c r=\"A1\"><v>7</v></c>", count: 200_000)
+        try workbook(sheetData: "<row r=\"1\">\(cells)<c r=\"C1\"><v>9</v></c></row>").write(to: url)
+        let sheet = try XCTUnwrap(XLSX.read(url).first)
+        XCTAssertEqual(sheet.rows, [["7", "", "9"]])
+    }
+
     // MARK: Video dimensions
 
     func testOddDimensionVideoConvertsToMP4AndMOV() async throws {

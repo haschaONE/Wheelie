@@ -149,9 +149,13 @@ enum XLSX {
             var nextRow = 0
             for row in doc.rootElement()?.child("sheetData")?.children("row") ?? [] {
                 // r is 1-based; a missing or non-positive one means "the next row".
-                let rowIndex = row.attr("r").flatMap(Int.init).map { $0 > 0 ? $0 - 1 : nextRow } ?? nextRow
+                // Excel's last row is 1,048,576; anything beyond is skipped without doing arithmetic
+                // on it (r="9223372036854775807" must not overflow nextRow).
+                let maxRows = 1_048_576
+                let parsed = row.attr("r").flatMap(Int.init)
+                let rowIndex = parsed.map { $0 > 0 ? $0 - 1 : nextRow } ?? nextRow
+                guard rowIndex < maxRows else { nextRow = maxRows; continue }
                 nextRow = rowIndex + 1
-                guard rowIndex < 1_048_576 else { continue }
                 var cells: [String] = []
                 var nextColumn = 0
                 for cell in row.children("c") {
@@ -163,9 +167,15 @@ enum XLSX {
                     let text = value(of: cell, shared: shared, dateStyles: dateStyles, date1904: date1904)
                     guard !text.isEmpty else { continue }
                     // Check before materialising anything: padding rows above and padding cells to the left.
-                    try checkArea(rowCount: max(rows.count, rowIndex + 1), columns: max(widest, column + 1))
-                    while cells.count < column { cells.append("") }
-                    cells.append(text)
+                    // Out-of-order or repeated references overwrite their column instead of growing
+                    // the row, so the row can never get longer than its highest column.
+                    try checkArea(rowCount: max(rows.count, rowIndex + 1), columns: max(widest, column + 1, cells.count))
+                    if column < cells.count {
+                        cells[column] = text
+                    } else {
+                        while cells.count < column { cells.append("") }
+                        cells.append(text)
+                    }
                 }
                 // Empty rows are only materialised (as cheap empty arrays) when a later row has content.
                 guard !cells.isEmpty else { continue }
