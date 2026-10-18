@@ -17,10 +17,13 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
             window.makeKeyAndOrderFront(nil)
             return
         }
-        let host = NSHostingView(rootView: WelcomeView(close: { [weak self] in self?.close() }))
-        host.sizingOptions = []
-        // Taller when the Homebrew hint is showing.
+        let host = NSHostingView(rootView: WelcomeView(close: { [weak self] in self?.close() },
+                                                       heightChanged: { [weak self] in self?.fit(contentHeight: $0) }))
+        // Measure while the hosting view still publishes its size: with `sizingOptions = []`
+        // fittingSize is zero. Taller when the Homebrew hint is showing.
         let size = NSSize(width: WelcomeView.width, height: ceil(host.fittingSize.height))
+        // The glass container sizes the host; the window follows the content via `fit`.
+        host.sizingOptions = []
         let window = WelcomeWindow(contentRect: NSRect(origin: .zero, size: size))
         window.contentView = ShellUI.glassContainer(cornerRadius: 24, content: host)
         window.setContentSize(size)
@@ -36,9 +39,27 @@ final class WelcomeWindowController: NSObject, NSWindowDelegate {
         window?.close()
     }
 
+    /// Keeps the window as tall as its content when rows appear or go (the launch-at-login
+    /// approval note or error), so nothing is clipped. The top edge stays put.
+    private func fit(contentHeight: CGFloat) {
+        guard let window, contentHeight > 0 else { return }
+        let height = ceil(contentHeight)
+        let frame = window.frame
+        let current = window.contentRect(forFrameRect: frame).height
+        guard abs(height - current) >= 1 else { return }
+        let content = NSRect(x: frame.minX, y: frame.maxY - height, width: frame.width, height: height)
+        window.setFrame(window.frameRect(forContentRect: content), display: true)
+        window.invalidateShadow()
+    }
+
     func windowWillClose(_ notification: Notification) {
         window = nil
     }
+}
+
+private struct WelcomeContentHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
 
 final class WelcomeWindow: NSWindow {
@@ -63,6 +84,8 @@ struct WelcomeView: View {
     static let width: CGFloat = 520
 
     let close: () -> Void
+    /// Called with the content's height whenever it changes, so the window can follow.
+    let heightChanged: @MainActor (CGFloat) -> Void
     /// Essential tools that aren't installed (checked once, when the window opens).
     let missingTools: [ToolStatus]
 
@@ -70,8 +93,10 @@ struct WelcomeView: View {
     @State private var hoveringClose = false
 
     init(close: @escaping () -> Void,
+         heightChanged: @escaping @MainActor (CGFloat) -> Void = { _ in },
          missingTools: [ToolStatus] = ToolCatalog.check(ToolCatalog.essentials).filter { !$0.isFound }) {
         self.close = close
+        self.heightChanged = heightChanged
         self.missingTools = missingTools
     }
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -153,6 +178,12 @@ struct WelcomeView: View {
         .padding(.bottom, 22)
         .frame(width: Self.width)
         .fixedSize(horizontal: false, vertical: true)
+        .background(GeometryReader { proxy in
+            Color.clear.preference(key: WelcomeContentHeightKey.self, value: proxy.size.height)
+        })
+        .onPreferenceChange(WelcomeContentHeightKey.self) { height in
+            MainActor.assumeIsolated { heightChanged(height) }
+        }
         // Empty areas of the window drag it around (it has no title bar).
         .background(ShellWindowDragArea())
         .overlay(alignment: .topTrailing) {

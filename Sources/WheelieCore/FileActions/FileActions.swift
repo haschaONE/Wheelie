@@ -213,18 +213,11 @@ public enum FileActions {
     }
 }
 
-/// Terminal apps the Terminal action knows by name. Any bundle id works; these get nice names.
+/// Names for the Terminal action's error messages; one catalog with the Settings window.
 public enum TerminalApps {
-    public static let defaultBundleID = "com.apple.Terminal"
-
-    public static let known: [(bundleID: String, name: String)] = [
-        ("com.apple.Terminal", "Terminal"),
-        ("com.googlecode.iterm2", "iTerm"),
-        ("dev.warp.Warp-Stable", "Warp"),
-        ("com.mitchellh.ghostty", "Ghostty"),
-    ]
+    public static let defaultBundleID = TerminalCatalog.defaultBundleID
 
     public static func name(for bundleID: String) -> String {
-        known.first { $0.bundleID.caseInsensitiveCompare(bundleID) == .orderedSame }?.name ?? bundleID
+        TerminalCatalog.app(for: bundleID).name
     }
 }

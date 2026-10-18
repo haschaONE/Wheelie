@@ -49,6 +49,8 @@ public struct ToolStatus: Identifiable, Hashable, Sendable {
 }
 
 public enum ToolCatalog {
+    /// Every tool some feature runs or looks up. Archives need nothing extra: Extract uses
+    /// the system's /usr/bin/tar (libarchive), which reads zip, 7z and rar.
     public static let all: [ToolRequirement] = [
         ToolRequirement(name: "ffmpeg", brewPackage: "ffmpeg",
                         purpose: "Video and audio conversion, GIFs, trimming", importance: .essential),
@@ -56,17 +58,19 @@ public enum ToolCatalog {
                         purpose: "Reads durations and tracks of media files", importance: .essential),
         ToolRequirement(name: "cwebp", brewPackage: "webp",
                         purpose: "WebP images", importance: .essential),
-        ToolRequirement(name: "7zz", brewPackage: "sevenzip",
-                        purpose: "Creating and extracting archives", importance: .recommended),
-        ToolRequirement(name: "unar", brewPackage: "unar",
-                        purpose: "Extracting RAR and other archives", importance: .optional),
         ToolRequirement(name: "exiftool", brewPackage: "exiftool",
                         purpose: "Removing metadata from more file types", importance: .optional),
         ToolRequirement(name: "soffice",
-                        extraPaths: ["/Applications/LibreOffice.app/Contents/MacOS/soffice"],
+                        extraPaths: libreOfficeAppPaths(),
                         brewPackage: "--cask libreoffice",
                         purpose: "Word, Excel and PowerPoint documents (LibreOffice)", importance: .optional),
     ]
+
+    /// LibreOffice.app's soffice in /Applications and ~/Applications, the same places
+    /// `LibreOffice.executable` checks after PATH.
+    public static func libreOfficeAppPaths(home: String = FileManager.default.homeDirectoryForCurrentUser.path) -> [String] {
+        ["/Applications", home + "/Applications"].map { $0 + "/LibreOffice.app/Contents/MacOS/soffice" }
+    }
 
     /// Tools the welcome window asks for when missing.
     public static var essentials: [ToolRequirement] { all.filter { $0.importance == .essential } }

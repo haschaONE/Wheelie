@@ -193,8 +193,12 @@ private struct OutputSettingsTab: View {
     private var folderWarning: String? {
         guard !customFolder.isEmpty else { return "Choose a folder, or results are saved next to the originals." }
         let url = URL(fileURLWithPath: customFolder, isDirectory: true)
-        if !FileManager.default.fileExists(atPath: url.path) { return "This folder no longer exists. Choose another one." }
-        if !OutputLocation.isUsableFolder(url) { return "Wheelie can't write to this folder. Choose another one." }
+        if !FileManager.default.fileExists(atPath: url.path) {
+            return "This folder isn't available (deleted, or on a drive that isn't connected), so results are saved next to the originals. Choose another one, or reconnect the drive."
+        }
+        if !OutputLocation.isUsableFolder(url) {
+            return "Wheelie can't write to this folder, so results are saved next to the originals. Choose another one."
+        }
         return nil
     }
 
@@ -236,9 +240,8 @@ private struct TerminalSettingsTab: View {
                 Text("Open in Terminal uses")
             } footer: {
                 VStack(alignment: .leading, spacing: 4) {
-                    if choices.first(where: { $0.app.bundleID == terminalApp })?.isInstalled == false {
-                        Text("\(TerminalCatalog.app(for: terminalApp).name) isn't installed, so Terminal opens instead.")
-                            .foregroundStyle(.orange)
+                    if let note = TerminalCatalog.missingSelectionNote(selected: terminalApp, isInstalled: Self.isInstalled) {
+                        Text(note).foregroundStyle(.orange)
                     }
                     Text("Drop files or folders on the wheel's Terminal petal to open a window there.")
                     if !others.isEmpty {
@@ -335,7 +338,7 @@ private struct ToolsSettingsTab: View {
             } header: {
                 Text("Command-line tools")
             } footer: {
-                Text("Wheelie uses free Homebrew tools for video, audio, WebP, archives and Office files, and looks for them in /opt/homebrew/bin, /usr/local/bin and /usr/bin.")
+                Text("Wheelie uses free Homebrew tools for video, audio, WebP, metadata and Office files, and looks for them in /opt/homebrew/bin, /usr/local/bin and /usr/bin.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
