@@ -38,9 +38,19 @@ final class LoginItemModel: ObservableObject {
         Binding(get: { self.isEnabled }, set: { self.setEnabled($0) })
     }
 
+    /// Re-reads the status. When it changed outside Wheelie (e.g. the user followed the error's
+    /// advice and allowed Wheelie in System Settings), an earlier error no longer applies.
     func refresh() {
+        if updateStatus() { errorMessage = nil }
+    }
+
+    /// Returns true when the status changed.
+    @discardableResult
+    private func updateStatus() -> Bool {
         let current = SMAppService.mainApp.status
-        if current != status { status = current }
+        guard current != status else { return false }
+        status = current
+        return true
     }
 
     func setEnabled(_ enabled: Bool) {
@@ -56,7 +66,7 @@ final class LoginItemModel: ObservableObject {
                 ? "Couldn't update launch at login: \(error.localizedDescription) You can try again, or set it up in System Settings › General › Login Items."
                 : "Launch at login needs the Wheelie app bundle (run scripts/bundle.sh and open Wheelie.app)."
         }
-        refresh()
+        updateStatus()   // not refresh(): keep the error this attempt just produced
     }
 
     func openLoginItemsSettings() {

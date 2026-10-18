@@ -137,9 +137,13 @@ final class AppServices: ObservableObject {
     /// Re-reads settings that affect core behaviour. Call after changing them.
     func applySettings() {
         let defaults = UserDefaults.standard
-        OutputNaming.preferredDirectory = OutputLocation(setting: defaults.string(forKey: SettingsKey.outputLocation))
+        let directory = OutputLocation(setting: defaults.string(forKey: SettingsKey.outputLocation))
             .directory(customPath: defaults.string(forKey: SettingsKey.customOutputFolder),
                        downloads: FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first)
+        // Runs on every UserDefaults change; only store when the folder actually changed.
+        if OutputNaming.configuredDirectory != directory {
+            OutputNaming.configuredDirectory = directory
+        }
     }
 
     func bool(_ key: String, default value: Bool) -> Bool {

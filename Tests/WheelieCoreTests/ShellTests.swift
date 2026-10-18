@@ -89,6 +89,66 @@ final class ShellSettingsTests: XCTestCase {
     }
 }
 
+final class OutputDirectorySettingTests: XCTestCase {
+    override func tearDown() {
+        OutputNaming.preferredDirectory = nil
+        super.tearDown()
+    }
+
+    /// A custom "Save to" folder that disappears (deleted, or an unplugged drive) must not
+    /// send every result to a dead path: outputs go next to the original until it's back.
+    func testMissingCustomFolderFallsBackToNextToTheOriginal() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("wheelie-out-\(UUID().uuidString)")
+        let sources = root.appendingPathComponent("src", isDirectory: true)
+        let custom = root.appendingPathComponent("Converted", isDirectory: true)
+        try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = sources.appendingPathComponent("photo.png")
+
+        OutputNaming.preferredDirectory = custom                     // set, but the folder doesn't exist
+        XCTAssertEqual(OutputNaming.configuredDirectory, custom)
+        XCTAssertNil(OutputNaming.preferredDirectory)
+        XCTAssertEqual(OutputNaming.uniqueURL(for: source, ext: "jpg").deletingLastPathComponent().path, sources.path)
+
+        try FileManager.default.createDirectory(at: custom, withIntermediateDirectories: true)   // drive reconnected
+        XCTAssertEqual(OutputNaming.preferredDirectory, custom)
+        XCTAssertEqual(OutputNaming.uniqueURL(for: source, ext: "jpg").deletingLastPathComponent().path, custom.path)
+
+        // A file where the folder should be isn't usable either.
+        let fileDir = root.appendingPathComponent("NotAFolder")
+        FileManager.default.createFile(atPath: fileDir.path, contents: Data())
+        OutputNaming.preferredDirectory = fileDir
+        XCTAssertNil(OutputNaming.preferredDirectory)
+    }
+
+    /// The app rewrites the setting on the main thread while background jobs read it; that
+    /// must not race (an unsynchronised URL global crashed with a use-after-free).
+    func testConcurrentWritesAndReadsAreSafe() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("wheelie-race-\(UUID().uuidString)")
+        let a = root.appendingPathComponent("A", isDirectory: true)
+        let b = root.appendingPathComponent("B", isDirectory: true)
+        try FileManager.default.createDirectory(at: a, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: b, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("x.png")
+
+        DispatchQueue.concurrentPerform(iterations: 8) { worker in
+            for i in 0..<4_000 {
+                if worker == 0 {
+                    // Fresh URL objects each time, so stores really release the old value.
+                    OutputNaming.preferredDirectory = URL(fileURLWithPath: (i % 2 == 0 ? a : b).path, isDirectory: true)
+                } else if i % 50 == 0 {
+                    _ = OutputNaming.uniqueURL(for: source, ext: "jpg")
+                } else {
+                    _ = OutputNaming.configuredDirectory?.appendingPathComponent("y").path
+                }
+            }
+        }
+        let final = try XCTUnwrap(OutputNaming.preferredDirectory)
+        XCTAssertTrue([a.path, b.path].contains(final.path))
+    }
+}
+
 final class TerminalCatalogTests: XCTestCase {
     func testKnownTerminals() {
         XCTAssertEqual(TerminalCatalog.known.map(\.name),
@@ -120,21 +180,48 @@ final class TerminalCatalogTests: XCTestCase {
         XCTAssertEqual(nothing.map(\.app.bundleID), ["com.apple.Terminal"])
     }
 
-    func testResolveFallsBackToTerminal() {
+    /// The Terminal petal opens exactly the saved app and throws when it's missing; Settings
+    /// must say so instead of promising a fallback to Terminal that never happens.
+    func testMissingSelectionNoteMatchesPetalBehaviour() {
         let isInstalled = { (id: String) in id == "com.apple.Terminal" || id == "com.github.wez.wezterm" }
-        XCTAssertEqual(TerminalCatalog.resolve(selected: "com.github.wez.wezterm", isInstalled: isInstalled).name, "WezTerm")
-        XCTAssertEqual(TerminalCatalog.resolve(selected: "org.alacritty", isInstalled: isInstalled).name, "Terminal")
-        XCTAssertEqual(TerminalCatalog.resolve(selected: nil, isInstalled: isInstalled).name, "Terminal")
-        XCTAssertEqual(TerminalCatalog.resolve(selected: "", isInstalled: isInstalled).name, "Terminal")
+        XCTAssertNil(TerminalCatalog.missingSelectionNote(selected: "com.github.wez.wezterm", isInstalled: isInstalled))
+        XCTAssertNil(TerminalCatalog.missingSelectionNote(selected: nil, isInstalled: isInstalled))
+        XCTAssertNil(TerminalCatalog.missingSelectionNote(selected: "", isInstalled: isInstalled))
+        let note = TerminalCatalog.missingSelectionNote(selected: "net.kovidgoyal.kitty", isInstalled: isInstalled)
+        XCTAssertEqual(note, "kitty isn't installed, so the Terminal petal can't open it. Choose an installed terminal above.")
+        XCTAssertFalse(note?.contains("opens instead") ?? true)
+    }
+
+    /// The petal's error names the app the same way the Settings list does (one catalog).
+    func testPetalErrorNamesComeFromTheSettingsCatalog() {
+        XCTAssertEqual(TerminalApps.defaultBundleID, TerminalCatalog.defaultBundleID)
+        for app in TerminalCatalog.known {
+            XCTAssertEqual(TerminalApps.name(for: app.bundleID), app.name)
+        }
+        XCTAssertEqual(FileActionError.appMissing(TerminalApps.name(for: "net.kovidgoyal.kitty")).localizedDescription
+                        .hasPrefix("kitty isn"), true)
     }
 }
 
 final class ToolCatalogTests: XCTestCase {
     func testCatalogCoversWheelieTools() {
-        XCTAssertEqual(ToolCatalog.all.map(\.name), ["ffmpeg", "ffprobe", "cwebp", "7zz", "unar", "exiftool", "soffice"])
+        // Only tools a feature runs: Extract uses /usr/bin/tar, so no 7zz / unar.
+        XCTAssertEqual(ToolCatalog.all.map(\.name), ["ffmpeg", "ffprobe", "cwebp", "exiftool", "soffice"])
         XCTAssertEqual(ToolCatalog.essentials.map(\.name), ["ffmpeg", "ffprobe", "cwebp"])
         XCTAssertEqual(ToolCatalog.all.first { $0.name == "exiftool" }?.importance, .optional)
         XCTAssertTrue(ToolCatalog.all.first { $0.name == "soffice" }?.isCask == true)
+    }
+
+    /// LibreOffice in ~/Applications works for conversion, so Settings must find it too.
+    func testLibreOfficeInUserApplicationsIsFound() {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let userCopy = home + "/Applications/LibreOffice.app/Contents/MacOS/soffice"
+        XCTAssertEqual(ToolCatalog.libreOfficeAppPaths(home: "/Users/x"),
+                       ["/Applications/LibreOffice.app/Contents/MacOS/soffice",
+                        "/Users/x/Applications/LibreOffice.app/Contents/MacOS/soffice"])
+        let statuses = ToolCatalog.check(locate: { _ in nil }, isExecutable: { $0 == userCopy })
+        XCTAssertEqual(statuses.first { $0.requirement.name == "soffice" }?.path?.path, userCopy)
+        XCTAssertFalse(ToolCatalog.installCommand(for: statuses)?.contains("libreoffice") ?? true)
     }
 
     func testCheckUsesLocateThenExtraPaths() {
@@ -150,7 +237,7 @@ final class ToolCatalogTests: XCTestCase {
     func testInstallCommand() {
         let none = ToolCatalog.check(locate: { _ in nil }, isExecutable: { _ in false })
         XCTAssertEqual(ToolCatalog.installCommand(for: none),
-                       "brew install ffmpeg webp sevenzip unar exiftool && brew install --cask libreoffice")
+                       "brew install ffmpeg webp exiftool && brew install --cask libreoffice")
 
         let essentials = ToolCatalog.check(ToolCatalog.essentials, locate: { _ in nil })
         XCTAssertEqual(ToolCatalog.installCommand(for: essentials), "brew install ffmpeg webp")
@@ -331,6 +418,32 @@ final class JobBoardTests: XCTestCase {
         board.advance(to: at(2))
         for (i, id) in ids.enumerated() { board.finish(id: id, error: nil, at: at(3 + Double(i) * 0.1)) }
         XCTAssertEqual(board.entries.map(\.id), Array(ids.suffix(3)))
+    }
+
+    /// Move To… cancelled in its folder picker (outcome .none) after the HUD appeared must not
+    /// turn into a green "Done" row.
+    func testJobWithoutResultLeavesInsteadOfShowingDone() {
+        var board = JobBoard()
+        let id = UUID()
+        board.start(id: id, title: "Move To…", sources: [src], at: at(0))
+        board.advance(to: at(5))
+        XCTAssertTrue(board.isPanelVisible)
+        let finished = board.finishWithoutResult(id: id, at: at(6))
+        XCTAssertEqual(finished?.state, .succeeded)
+        XCTAssertNil(finished?.feedback)
+        XCTAssertTrue(board.entries.isEmpty)
+        XCTAssertFalse(board.isPanelVisible)
+        XCTAssertNil(board.nextDeadline())
+        XCTAssertNil(board.finishWithoutResult(id: id, at: at(7)))
+
+        // Other entries stay on screen.
+        let a = UUID(), b = UUID()
+        board.start(id: a, title: "A", sources: [src], at: at(10))
+        board.start(id: b, title: "B", sources: [src], at: at(10))
+        board.advance(to: at(12))
+        board.finishWithoutResult(id: b, at: at(13))
+        XCTAssertEqual(board.visibleEntries.map(\.id), [a])
+        XCTAssertTrue(board.visibleEntries[0].isRunning)
     }
 
     func testSourceSummary() {

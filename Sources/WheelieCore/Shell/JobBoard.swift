@@ -141,6 +141,22 @@ public struct JobBoard: Sendable {
         return entry
     }
 
+    /// Marks a job finished that produced nothing to report (`WheelOutcome.none`: the user
+    /// cancelled a folder picker, or the job only opened a window). It leaves the board right
+    /// away rather than showing "Done", which would suggest something happened. Returns the
+    /// entry (succeeded, no outputs, no feedback), or nil for an unknown id.
+    @discardableResult
+    public mutating func finishWithoutResult(id: UUID, at now: Date) -> Entry? {
+        pendingOutputs = []
+        advance(to: now)
+        guard let index = entries.firstIndex(where: { $0.id == id }), entries[index].isRunning else { return nil }
+        var entry = entries.remove(at: index)
+        entry.finishedAt = now
+        entry.state = .succeeded
+        entry.outputs = []
+        return entry
+    }
+
     /// Pointer entered or left the HUD. Finished entries don't expire while hovered.
     public mutating func setHovering(_ hovering: Bool, at now: Date) {
         guard hovering != isHovering else { return }

@@ -36,7 +36,13 @@ final class JobProgressController {
         observers.append(ShellFeature.observe(.wheelieJobFinished) { [weak self] note in
             guard let self, let id = note.userInfo?["id"] as? UUID else { return }
             let error = note.userInfo?["error"] as? String
-            let finished = self.board.finish(id: id, error: error, at: Date())
+            let finished: JobBoard.Entry?
+            if error == nil, note.userInfo?["outcome"] as? String == "none" {
+                // e.g. Move To… cancelled in its folder picker: drop the row instead of "Done ✓".
+                finished = self.board.finishWithoutResult(id: id, at: Date())
+            } else {
+                finished = self.board.finish(id: id, error: error, at: Date())
+            }
             ShellFeedback.shared.jobFinished(finished?.feedback ?? (error == nil ? nil : .failure))
             self.refresh()
         })

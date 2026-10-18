@@ -57,9 +57,11 @@ public enum TerminalCatalog {
         known.filter { !isInstalled($0.bundleID) }
     }
 
-    /// The terminal to actually open: the saved choice when installed, else Terminal.
-    public static func resolve(selected: String?, isInstalled: (String) -> Bool) -> TerminalApp {
-        if let selected, !selected.isEmpty, isInstalled(selected) { return app(for: selected) }
-        return known[0]
+    /// Settings note shown when the saved terminal isn't installed, or nil when it is.
+    /// The Terminal petal opens exactly the saved app (it fails with "<name> isn't installed…"
+    /// rather than quietly switching apps), so the note asks for another choice.
+    public static func missingSelectionNote(selected: String?, isInstalled: (String) -> Bool) -> String? {
+        guard let selected, !selected.isEmpty, !isInstalled(selected) else { return nil }
+        return "\(app(for: selected).name) isn't installed, so the Terminal petal can't open it. Choose an installed terminal above."
     }
 }
