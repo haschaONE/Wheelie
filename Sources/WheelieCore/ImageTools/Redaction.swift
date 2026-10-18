@@ -72,20 +72,8 @@ public enum Redactor {
                 ctx.setFillColor(CGColor(gray: 0, alpha: 1))
                 ctx.fill(rect)
             case .blur, .pixelate:
-                // CoreImage is y-up.
-                let ciRect = CGRect(x: rect.minX, y: size.height - rect.maxY, width: rect.width, height: rect.height)
-                let region = input.cropped(to: ciRect).clampedToExtent()
-                let processed: CIImage
-                if settings.style == .pixelate {
-                    processed = region.applyingFilter("CIPixellate", parameters: [
-                        kCIInputScaleKey: blockSize(for: size),
-                        kCIInputCenterKey: CIVector(x: ciRect.minX, y: ciRect.minY),
-                    ])
-                } else {
-                    processed = region.applyingGaussianBlur(sigma: blurRadius(for: size))
-                }
-                guard let patch = context.createCGImage(processed.cropped(to: ciRect), from: ciRect,
-                                                        format: .RGBA8, colorSpace: space) else {
+                guard let patch = patch(input, pixelRect: rect, imageSize: size, style: settings.style,
+                                        colorSpace: space, context: context) else {
                     throw ImageToolError.renderFailed("redacted photo")
                 }
                 ImageToolsIO.draw(patch, in: rect, context: ctx)
@@ -95,22 +83,41 @@ public enum Redactor {
         return result
     }
 
-    /// The whole photo blurred or pixelated, for drawing live previews clipped to each rectangle.
-    public static func effectImage(_ image: CGImage, style: RedactionStyle,
-                                   context: CIContext = ImageAdjust.sharedContext) -> CGImage? {
-        let size = CGSize(width: image.width, height: image.height)
-        let input = CIImage(cgImage: image)
-        let output: CIImage
+    /// The blurred or pixelated pixels for one rectangle (whole pixels, top-left origin, as returned by
+    /// `pixelRect`), derived only from that rectangle: it's cropped and edge-clamped first, and the
+    /// pixelation grid starts at its own corner. Nil for black boxes.
+    static func patch(_ input: CIImage, pixelRect rect: CGRect, imageSize size: CGSize, style: RedactionStyle,
+                      colorSpace: CGColorSpace, context: CIContext) -> CGImage? {
+        // CoreImage is y-up.
+        let ciRect = CGRect(x: rect.minX, y: size.height - rect.maxY, width: rect.width, height: rect.height)
+        let region = input.cropped(to: ciRect).clampedToExtent()
+        let processed: CIImage
         switch style {
         case .blackBox: return nil
-        case .blur: output = input.clampedToExtent().applyingGaussianBlur(sigma: blurRadius(for: size))
         case .pixelate:
-            output = input.clampedToExtent().applyingFilter("CIPixellate", parameters: [
-                kCIInputScaleKey: blockSize(for: size), kCIInputCenterKey: CIVector(x: 0, y: 0),
+            processed = region.applyingFilter("CIPixellate", parameters: [
+                kCIInputScaleKey: blockSize(for: size),
+                kCIInputCenterKey: CIVector(x: ciRect.minX, y: ciRect.minY),
             ])
+        case .blur:
+            processed = region.applyingGaussianBlur(sigma: blurRadius(for: size))
         }
-        return context.createCGImage(output.cropped(to: input.extent), from: input.extent, format: .RGBA8,
-                                     colorSpace: ImageToolsIO.workingColorSpace(for: image))
+        return context.createCGImage(processed.cropped(to: ciRect), from: ciRect, format: .RGBA8, colorSpace: colorSpace)
+    }
+
+    /// Live preview of one blur/pixelate rectangle on `image` (typically a downscaled copy of the photo,
+    /// with `rect` in its pixels): the same per-rectangle effect `render` burns in, at this resolution.
+    /// Returns the whole-pixel rectangle covered and its replacement pixels; nil for black boxes or
+    /// rectangles outside the image.
+    public static func previewPatch(_ image: CGImage, rect: CGRect, style: RedactionStyle,
+                                    context: CIContext = ImageAdjust.sharedContext) -> (rect: CGRect, image: CGImage)? {
+        let size = CGSize(width: image.width, height: image.height)
+        let pixels = pixelRect(rect, in: size)
+        guard !pixels.isNull, !pixels.isEmpty,
+              let patch = patch(CIImage(cgImage: image), pixelRect: pixels, imageSize: size, style: style,
+                                colorSpace: ImageToolsIO.workingColorSpace(for: image), context: context)
+        else { return nil }
+        return (pixels, patch)
     }
 }
 

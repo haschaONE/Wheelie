@@ -380,6 +380,29 @@ final class AnnotationTests: XCTestCase {
         XCTAssertEqual(pixel(highlighted, 60, 5), pixel(base, 60, 5))
         XCTAssertNotEqual(pixel(highlighted, 60, 40), pixel(base, 60, 40))
 
+        // The live preview composites like the export: the highlighter multiplies onto the photo, so
+        // black text under it stays black (regression: drawn on a transparent overlay it became an
+        // olive smear in the preview only).
+        let dark = solid(120, 80, gray: 0)
+        let exportedDark = try AnnotationRenderer.render(dark, AnnotationDocument(annotations: [hl]))
+        XCTAssertEqual(pixel(exportedDark, 60, 40), RGBA(r: 0, g: 0, b: 0, a: 255))
+        let doc = AnnotationDocument(annotations: [hl])
+        let size = CGSize(width: 120, height: 80)
+        let samePreview = try AnnotationRenderer.preview([hl], on: dark, imageSize: size, scale: doc.scale(for: size),
+                                                         blurSource: nil)
+        XCTAssertEqual(pixels(samePreview), pixels(exportedDark))
+        let halfPreview = try AnnotationRenderer.preview([hl], on: solid(60, 40, gray: 0), imageSize: size,
+                                                         scale: doc.scale(for: size), blurSource: nil)
+        XCTAssertEqual(halfPreview.width, 60)
+        XCTAssertEqual(pixel(halfPreview, 30, 20), RGBA(r: 0, g: 0, b: 0, a: 255))
+        // On white it's the highlight color, in the preview as in the export.
+        let white = solid(60, 40)
+        let onWhite = try AnnotationRenderer.preview([hl], on: white, imageSize: size, scale: doc.scale(for: size),
+                                                     blurSource: nil)
+        let tint = pixel(onWhite, 30, 20)
+        XCTAssertEqual(tint.r, 255)
+        XCTAssertLessThan(tint.b, 200)
+
         let brush = Annotation(kind: .blur, points: [CGPoint(x: 20, y: 40), CGPoint(x: 100, y: 40)], lineWidth: 5)
         let blurred = try AnnotationRenderer.render(base, AnnotationDocument(annotations: [brush]))
         let region = CGRect(x: 40, y: 34, width: 40, height: 12)
@@ -532,8 +555,40 @@ final class RedactionTests: XCTestCase {
         XCTAssertLessThan(lumaStats(blurred, in: region).variance, original * 0.25)
         XCTAssertEqual(pixel(blurred, 110, 5), pixel(image, 110, 5))
 
-        XCTAssertNotNil(Redactor.effectImage(image, style: .pixelate))
-        XCTAssertNil(Redactor.effectImage(image, style: .blackBox))
+        XCTAssertNotNil(Redactor.previewPatch(image, rect: region, style: .pixelate))
+        XCTAssertNil(Redactor.previewPatch(image, rect: region, style: .blackBox))
+    }
+
+    /// The live preview must show exactly what export burns in: per-rectangle grid anchored at the
+    /// rectangle's corner, sampling only the rectangle's own pixels (regression: the preview used a
+    /// whole-photo effect with the grid at the image origin and blur bleeding in from outside).
+    func testPreviewPatchMatchesExport() throws {
+        let image = noise(300, 200)
+        // Off the image-origin block grid on purpose, with a bright frame around it that a whole-photo
+        // blur would pull in.
+        let rect = CGRect(x: 107, y: 41, width: 90, height: 70)
+        for style in [RedactionStyle.pixelate, .blur] {
+            let exported = try Redactor.render(image, RedactSettings(rects: [RedactionRect(rect: rect)], style: style))
+            let patch = try XCTUnwrap(Redactor.previewPatch(image, rect: rect, style: style))
+            XCTAssertEqual(patch.rect, rect)
+            XCTAssertEqual(patch.image.width, Int(rect.width))
+            let p = pixels(patch.image), e = pixels(exported)
+            var mismatches = 0
+            for y in 0..<Int(rect.height) {
+                for x in 0..<Int(rect.width)
+                where !near(pixel(p, width: patch.image.width, x, y),
+                            pixel(e, width: exported.width, x + Int(rect.minX), y + Int(rect.minY)), 1) {
+                    mismatches += 1
+                }
+            }
+            XCTAssertEqual(mismatches, 0, "\(style) preview differs from export")
+        }
+        // Pixelation blocks start at the rectangle's own corner.
+        let block = Int(Redactor.blockSize(for: CGSize(width: 300, height: 200)))
+        let patch = try XCTUnwrap(Redactor.previewPatch(image, rect: rect, style: .pixelate)).image
+        let first = pixel(patch, 0, 0)
+        XCTAssertEqual(pixel(patch, block - 1, 0), first)
+        XCTAssertNotEqual(pixel(patch, block, 0), first)
     }
 
     func testPixelRectAndDedupe() {
@@ -717,5 +772,136 @@ final class ImageExportTests: XCTestCase {
         XCTAssertTrue(ImageToolsIO.plan(sourceType: UTType.webP.identifier, sourceExtension: "webp", transparent: false,
                                         cwebpAvailable: true).useCWebP)
         XCTAssertEqual(ImageToolsIO.plan(sourceType: UTType.bmp.identifier, sourceExtension: "bmp", transparent: true).type, .png)
+    }
+
+    /// The extension always names the encoded format (regression: it came from the file name while the
+    /// encoder came from the sniffed content).
+    func testExportPlanExtensionFollowsContent() {
+        func plan(_ type: UTType, _ ext: String, transparent: Bool = false) -> ImageToolsIO.ExportPlan {
+            ImageToolsIO.plan(sourceType: type.identifier, sourceExtension: ext, transparent: transparent,
+                              cwebpAvailable: true)
+        }
+        // Matching names keep their spelling.
+        XCTAssertEqual(plan(.jpeg, "JPG").fileExtension, "JPG")
+        XCTAssertEqual(plan(.jpeg, "jpe").fileExtension, "jpe")
+        XCTAssertEqual(plan(.tiff, "tif").fileExtension, "tif")
+        XCTAssertEqual(plan(.heic, "heif").fileExtension, "heif")
+        // Misnamed files get the real format's extension.
+        XCTAssertEqual(plan(.jpeg, "png"), ImageToolsIO.ExportPlan(type: .jpeg, fileExtension: "jpg", useCWebP: false))
+        XCTAssertEqual(plan(.png, "jpg", transparent: true), ImageToolsIO.ExportPlan(type: .png, fileExtension: "png", useCWebP: false))
+        XCTAssertEqual(plan(.webP, "jpg"), ImageToolsIO.ExportPlan(type: .webP, fileExtension: "webp", useCWebP: true))
+        XCTAssertEqual(plan(.png, "webp"), ImageToolsIO.ExportPlan(type: .png, fileExtension: "png", useCWebP: false))
+        XCTAssertEqual(plan(.jpeg, "").fileExtension, "jpg")
+        XCTAssertEqual(plan(.jpeg, "download").fileExtension, "jpg")
+    }
+
+    /// ICO/ICNS only hold a few square sizes; other results go to PNG (regression: Crop of an icon
+    /// failed at finalize with "Couldn't save … crop.icns.").
+    func testExportPlanIconSizes() {
+        func type(_ t: UTType, _ w: Int, _ h: Int) -> UTType {
+            ImageToolsIO.plan(sourceType: t.identifier, sourceExtension: t.preferredFilenameExtension ?? "",
+                              transparent: true, pixelSize: CGSize(width: w, height: h)).type
+        }
+        for side in [16, 32, 64, 128, 256, 512, 1024] { XCTAssertEqual(type(.icns, side, side), .icns, "\(side)") }
+        for (w, h) in [(800, 800), (100, 80), (257, 257), (200, 200), (2048, 2048)] { XCTAssertEqual(type(.icns, w, h), .png) }
+        for side in [16, 32, 48, 64, 128, 256] { XCTAssertEqual(type(.ico, side, side), .ico, "\(side)") }
+        for (w, h) in [(200, 150), (200, 200), (512, 512), (300, 300)] { XCTAssertEqual(type(.ico, w, h), .png) }
+        // Unknown size: don't promise an icon.
+        XCTAssertEqual(ImageToolsIO.plan(sourceType: UTType.ico.identifier, sourceExtension: "ico", transparent: false).type, .png)
+    }
+
+    func testIconExportFallsBackToPNG() async throws {
+        let dir = try tempFolder()
+        func icon(_ side: Int) -> CGImage {
+            makeImage(side, side, alpha: true) { ctx in
+                ctx.setFillColor(CGColor(srgbRed: 0.2, green: 0.4, blue: 0.9, alpha: 0.8))
+                ctx.fillEllipse(in: CGRect(x: 0, y: 0, width: side, height: side))
+            }
+        }
+        // An iconutil-style .icns: frame 0 is 1024 px at 144 DPI.
+        let icns = dir.appendingPathComponent("App.icns")
+        try write(icon(1024), to: icns, type: .icns, properties: [kCGImagePropertyDPIWidth: 144, kCGImagePropertyDPIHeight: 144])
+        let icnsSource = try ImageToolsIO.load(icns)
+        XCTAssertEqual(icnsSource.typeIdentifier, UTType.icns.identifier)
+
+        let crop800 = try ImageCrop.render(icnsSource.image, CropSettings(cropRect: CGRect(x: 0, y: 0, width: 800, height: 800)))
+        let out800 = try await ImageToolsIO.export(crop800, source: icnsSource, suffix: " crop")
+        XCTAssertEqual(out800.lastPathComponent, "App crop.png")
+        XCTAssertEqual(try ImageToolsIO.load(out800).size, CGSize(width: 800, height: 800))
+
+        // Supported sizes stay icons, whatever DPI the source carried.
+        let crop512 = try ImageCrop.render(icnsSource.image, CropSettings(cropRect: CGRect(x: 0, y: 0, width: 512, height: 512)))
+        let out512 = try await ImageToolsIO.export(crop512, source: icnsSource, suffix: " crop")
+        XCTAssertEqual(out512.pathExtension, "icns")
+        let full = try await ImageToolsIO.export(icnsSource.image, source: icnsSource, suffix: " plain", preserveMetadata: false)
+        XCTAssertEqual(full.pathExtension, "icns")
+        XCTAssertEqual(try ImageToolsIO.load(full).size, CGSize(width: 1024, height: 1024))
+
+        // A 256 px favicon cropped to a non-square size.
+        let ico = dir.appendingPathComponent("favicon.ico")
+        try write(icon(256), to: ico, type: .ico)
+        let icoSource = try ImageToolsIO.load(ico)
+        let cropIco = try ImageCrop.render(icoSource.image, CropSettings(cropRect: CGRect(x: 0, y: 0, width: 200, height: 150)))
+        let outIco = try await ImageToolsIO.export(cropIco, source: icoSource, suffix: " crop")
+        XCTAssertEqual(outIco.lastPathComponent, "favicon crop.png")
+        XCTAssertTrue(ImageToolsIO.hasTransparency(try ImageToolsIO.load(outIco).image))
+        let sameIco = try await ImageToolsIO.export(icoSource.image, source: icoSource, suffix: " adjust")
+        XCTAssertEqual(sameIco.pathExtension, "ico")
+    }
+
+    func testMisnamedSourceExportsWithMatchingExtension() async throws {
+        let dir = try tempFolder()
+        let misnamed = dir.appendingPathComponent("x.png")
+        try write(quadrants(40, 30), to: misnamed, type: .jpeg)
+        let source = try ImageToolsIO.load(misnamed)
+        XCTAssertEqual(source.typeIdentifier, UTType.jpeg.identifier)
+        let out = try await ImageToolsIO.export(source.image, source: source, suffix: " adjust")
+        XCTAssertEqual(out.lastPathComponent, "x adjust.jpg")
+        let written = try XCTUnwrap(CGImageSourceCreateWithURL(out as CFURL, nil))
+        XCTAssertEqual(CGImageSourceGetType(written) as String?, UTType.jpeg.identifier)
+    }
+}
+
+// MARK: - Undo history
+
+final class EditHistoryTests: XCTestCase {
+    /// Redact's scenario: draw a rectangle, nudge it with the arrow keys, ⌘Z. The nudges must undo as
+    /// one step back to the drawn position (regression: they skipped the checkpoint, so ⌘Z removed
+    /// the rectangle instead).
+    func testNudgesCoalesceIntoOneUndoStep() {
+        var history = EditHistory<[CGRect]>()
+        var rects: [CGRect] = []
+        let drawn = CGRect(x: 10, y: 10, width: 50, height: 40)
+        history.checkpoint(rects)              // draw
+        rects = [drawn]
+        for _ in 0..<3 {                       // three nudges of the same rectangle
+            history.checkpoint(rects, group: "nudge-a")
+            rects[0].origin.x += 10
+        }
+        XCTAssertEqual(history.undoStack.count, 2)
+        rects = history.undo(from: rects) ?? rects
+        XCTAssertEqual(rects, [drawn], "undo moves the rectangle back instead of removing it")
+        rects = history.undo(from: rects) ?? rects
+        XCTAssertEqual(rects, [])
+        XCTAssertFalse(history.canUndo)
+        rects = history.redo(from: rects) ?? rects
+        rects = history.redo(from: rects) ?? rects
+        XCTAssertEqual(rects.first?.minX, 40)
+        XCTAssertFalse(history.canRedo)
+    }
+
+    func testGroupsEndOnOtherEditsAndUndo() {
+        var history = EditHistory<Int>(limit: 3)
+        history.checkpoint(0, group: "nudge-a")
+        history.checkpoint(1, group: "nudge-a")    // coalesced
+        history.checkpoint(1)                      // other edit ends the group
+        history.checkpoint(2, group: "nudge-a")    // new group
+        XCTAssertEqual(history.undoStack, [0, 1, 2])
+        XCTAssertEqual(history.undo(from: 3), 2)
+        history.checkpoint(2, group: "nudge-a")    // after undo, the same group starts a new step
+        XCTAssertEqual(history.undoStack, [0, 1, 2])
+        XCTAssertFalse(history.canRedo, "a new edit clears redo")
+        history.checkpoint(3, group: "nudge-b")
+        XCTAssertEqual(history.undoStack, [1, 2, 3], "limited to the newest steps")
     }
 }

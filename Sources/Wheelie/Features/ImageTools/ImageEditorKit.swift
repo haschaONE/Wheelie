@@ -34,11 +34,22 @@ enum ImageEditorUI {
         }.value
     }
 
-    /// "JPG", "PNG"… — the format an edit of `source` will be saved in (if it stays as opaque as now).
+    /// "JPG", "PNG"… — the format a same-size edit of `source` will be saved in (if it stays as opaque as now).
     static func formatLabel(for source: SourceImage, preview: CGImage) async -> String {
-        let transparent = await Task.detached(priority: .utility) { ImageToolsIO.hasTransparency(preview) }.value
-        return ImageToolsIO.plan(sourceType: source.typeIdentifier, sourceExtension: source.url.pathExtension,
-                                 transparent: transparent).fileExtension.uppercased()
+        let transparent = await isTransparent(preview)
+        return formatLabel(for: source, transparent: transparent, size: source.size,
+                           cwebpAvailable: Tools.locate("cwebp") != nil)
+    }
+
+    /// The format an edit of `source` with the given transparency and pixel size will be saved in.
+    static func formatLabel(for source: SourceImage, transparent: Bool, size: CGSize, cwebpAvailable: Bool) -> String {
+        ImageToolsIO.plan(sourceType: source.typeIdentifier, sourceExtension: source.url.pathExtension,
+                          transparent: transparent, pixelSize: size,
+                          cwebpAvailable: cwebpAvailable).fileExtension.uppercased()
+    }
+
+    static func isTransparent(_ preview: CGImage) async -> Bool {
+        await Task.detached(priority: .utility) { ImageToolsIO.hasTransparency(preview) }.value
     }
 
     /// Appended to the status line for animated GIFs and multi-page TIFFs.
