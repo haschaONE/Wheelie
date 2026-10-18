@@ -8,12 +8,14 @@ public enum ConversionError: LocalizedError {
     case unsupported(FileKind, OutputFormat)
     case unreadable(URL)
     case writeFailed(URL)
+    case noAudioTrack(URL)
 
     public var errorDescription: String? {
         switch self {
         case .unsupported(let kind, let format): return "Can't convert \(kind.rawValue) to \(format.label)."
         case .unreadable(let url): return "Couldn't read \(url.lastPathComponent)."
         case .writeFailed(let url): return "Couldn't write \(url.lastPathComponent)."
+        case .noAudioTrack(let url): return "\(url.lastPathComponent) has no audio track."
         }
     }
 }
@@ -62,30 +64,18 @@ public enum Converter {
                 try await Tools.run("gif2webp", ["-quiet", "-q", "80", "-m", "4", source.path, "-o", output.path])
                 return
             }
-            // cwebp reads PNG/JPEG/TIFF/WebP only; route anything else through a temp PNG.
-            let readable = ["png", "jpg", "jpeg", "tif", "tiff", "webp"].contains(source.pathExtension.lowercased())
-            try await withTemporaryPNG(of: readable ? nil : source) { png in
+            // cwebp reads PNG/JPEG/TIFF/WebP only, ignores EXIF orientation and can't read CMYK JPEGs;
+            // anything it would get wrong goes through a temporary PNG from loadImage, which handles all three.
+            try await withTemporaryPNG(of: cwebpReadsDirectly(source) ? nil : source) { png in
                 try await Tools.run("cwebp", ["-quiet", "-q", "85", "-metadata", "icc", (png ?? source).path, "-o", output.path])
             }
         case .pdf:
-            guard let data = try? Data(contentsOf: source), let image = NSImage(data: data), let page = PDFPage(image: image) else {
-                throw ConversionError.unreadable(source)
-            }
-            let doc = PDFDocument()
-            doc.insert(page, at: 0)
-            guard doc.write(to: output) else { throw ConversionError.writeFailed(output) }
+            try writeImagePDF(source, to: output)
         case .avif:
             if imageIOWrites(avifType) {
                 try writeImage(try loadImage(source), to: output, type: UTType(avifType) ?? .png, quality: 0.75)
             } else {
-                guard let encoder = try await ffmpegAV1Encoder() else {
-                    throw ConversionError.unsupported(.image, .avif)
-                }
-                try await withTemporaryPNG(of: source) { png in
-                    try await Tools.run("ffmpeg", ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", png!.path,
-                                                   "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", encoder, "-crf", "32",
-                                                   "-pix_fmt", "yuv420p", "-frames:v", "1", "-still-picture", "1", output.path])
-                }
+                try await writeAVIFWithFFmpeg(source, to: output)
             }
         case .ico:
             try writeIcon(try loadImage(source), to: output)
@@ -100,6 +90,109 @@ public enum Converter {
             if format == .jpeg { image = flattened(image) }
             try writeImage(image, to: output, type: utType(for: format))
         }
+    }
+
+    /// Whether cwebp can be given the original: a format it reads, stored upright, in RGB or gray.
+    static func cwebpReadsDirectly(_ url: URL) -> Bool {
+        guard ["png", "jpg", "jpeg", "tif", "tiff", "webp"].contains(url.pathExtension.lowercased()),
+              let src = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+        else { return false }
+        let orientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        let model = props[kCGImagePropertyColorModel] as? String
+        let plainColor = model == nil || model == kCGImagePropertyColorModelRGB as String
+            || model == kCGImagePropertyColorModelGray as String
+        return orientation == 1 && plainColor
+    }
+
+    /// Multi-page TIFF → PDF limits, checked from the headers before any page is decoded.
+    static let maxTIFFPages = 2_000
+    static let maxTIFFPagePixels = 100_000_000
+    static let maxTIFFTotalPixels = 1_000_000_000
+
+    /// Image → PDF, one page per image. A multi-page TIFF (scans, faxes) keeps every page, upright
+    /// and sized from its DPI; other formats' extra frames (animation frames, icon sizes) aren't pages.
+    static func writeImagePDF(_ source: URL, to output: URL) throws {
+        let doc = PDFDocument()
+        let isTIFF = ["tif", "tiff"].contains(source.pathExtension.lowercased())
+        if isTIFF, let src = CGImageSourceCreateWithURL(source as CFURL, nil), CGImageSourceGetCount(src) > 1 {
+            let pages = try tiffPageProperties(src, name: source.lastPathComponent)
+            for (index, props) in pages.enumerated() {
+                let image = try loadImage(source, index: index)
+                guard let page = PDFPage(image: NSImage(cgImage: image, size: pointSize(of: image, properties: props))) else {
+                    throw ConversionError.unreadable(source)
+                }
+                doc.insert(page, at: doc.pageCount)
+            }
+        } else {
+            guard let data = try? Data(contentsOf: source), let image = NSImage(data: data), let page = PDFPage(image: image) else {
+                throw ConversionError.unreadable(source)
+            }
+            doc.insert(page, at: 0)
+        }
+        guard doc.write(to: output) else { throw ConversionError.writeFailed(output) }
+    }
+
+    /// Every page's properties, after checking the page count, each page's pixels and their sum against
+    /// the limits, so a TIFF declaring thousands of pages or gigapixel pages is refused before anything
+    /// is decoded (the properties come from the headers alone).
+    static func tiffPageProperties(_ src: CGImageSource, name: String) throws -> [[CFString: Any]] {
+        let count = CGImageSourceGetCount(src)
+        guard count <= maxTIFFPages else {
+            throw DocumentError.tooLarge("\(name) has \(count) pages; at most \(maxTIFFPages) can be converted to PDF.")
+        }
+        var pages: [[CFString: Any]] = []
+        var total = 0
+        for index in 0..<count {
+            guard let props = CGImageSourceCopyPropertiesAtIndex(src, index, nil) as? [CFString: Any],
+                  let width = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+                  let height = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+                  width > 0, height > 0
+            else { throw DocumentError.unreadable("Couldn't read page \(index + 1) of \(name).") }
+            let (pixels, overflow) = width.multipliedReportingOverflow(by: height)
+            guard !overflow, pixels <= maxTIFFPagePixels else {
+                throw DocumentError.tooLarge("\(name) is too large to convert: page \(index + 1) is \(width) × \(height) pixels "
+                    + "(at most \(maxTIFFPagePixels / 1_000_000) megapixels per page).")
+            }
+            total += pixels
+            guard total <= maxTIFFTotalPixels else {
+                throw DocumentError.tooLarge("\(name) is too large to convert: its pages add up to more than "
+                    + "\(maxTIFFTotalPixels / 1_000_000) megapixels.")
+            }
+            pages.append(props)
+        }
+        return pages
+    }
+
+    /// Page size in points from the page's DPI (72 when absent), as NSImage would size it.
+    static func pointSize(of image: CGImage, properties props: [CFString: Any]) -> CGSize {
+        func dpi(_ key: CFString) -> CGFloat {
+            let value = (props[key] as? NSNumber)?.doubleValue ?? 72
+            return value > 0 ? CGFloat(value) : 72
+        }
+        var (dpiX, dpiY) = (dpi(kCGImagePropertyDPIWidth), dpi(kCGImagePropertyDPIHeight))
+        // Orientations 5–8 swap the axes (loadImage already rotated the pixels), so swap the DPIs too.
+        if ((props[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1) >= 5 { swap(&dpiX, &dpiY) }
+        return CGSize(width: CGFloat(image.width) * 72 / dpiX, height: CGFloat(image.height) * 72 / dpiY)
+    }
+
+    /// AVIF through ffmpeg, for systems whose ImageIO has no AVIF writer.
+    static func writeAVIFWithFFmpeg(_ source: URL, to output: URL) async throws {
+        guard let encoder = try await ffmpegAV1Encoder() else {
+            throw ConversionError.unsupported(.image, .avif)
+        }
+        try await withTemporaryPNG(of: source) { png in
+            try await Tools.run("ffmpeg", ffmpegAVIFArguments(input: png!, output: output, encoder: encoder))
+        }
+    }
+
+    static func ffmpegAVIFArguments(input: URL, output: URL, encoder: String) -> [String] {
+        var args = ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", input.path,
+                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", encoder, "-crf", "32",
+                    "-pix_fmt", "yuv420p", "-frames:v", "1"]
+        // -still-picture is a libaom-av1 option; libsvtav1 and librav1e reject it as unknown.
+        if encoder == "libaom-av1" { args += ["-still-picture", "1"] }
+        return args + [output.path]
     }
 
     static func utType(for format: OutputFormat) -> UTType {
@@ -136,10 +229,10 @@ public enum Converter {
         CGImageSourceCreateWithURL(url as CFURL, nil).map(CGImageSourceGetCount) ?? 0
     }
 
-    static func loadImage(_ url: URL) throws -> CGImage {
+    static func loadImage(_ url: URL, index: Int = 0) throws -> CGImage {
         if url.pathExtension.lowercased() == "svg" { return try rasterizeSVG(url) }
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let props = CGImageSourceCopyPropertiesAtIndex(src, index, nil) as? [CFString: Any],
               let width = props[kCGImagePropertyPixelWidth] as? Int,
               let height = props[kCGImagePropertyPixelHeight] as? Int
         else { throw ConversionError.unreadable(url) }
@@ -149,7 +242,7 @@ public enum Converter {
             kCGImageSourceCreateThumbnailWithTransform: true,
             kCGImageSourceThumbnailMaxPixelSize: max(width, height),
         ]
-        guard let image = CGImageSourceCreateThumbnailAtIndex(src, 0, options as CFDictionary) else {
+        guard let image = CGImageSourceCreateThumbnailAtIndex(src, index, options as CFDictionary) else {
             throw ConversionError.unreadable(url)
         }
         return image
@@ -370,8 +463,19 @@ public enum Converter {
             }
         } catch {
             try? FileManager.default.removeItem(at: output)
+            // ffmpeg only says "Output file does not contain any stream", not why.
+            if format.isAudio, await hasAudioStream(source) == false { throw ConversionError.noAudioTrack(source) }
             throw error
         }
         return output
+    }
+
+    /// Whether ffprobe finds an audio stream; nil when it can't tell (not installed, unreadable file).
+    static func hasAudioStream(_ source: URL) async -> Bool? {
+        guard Tools.locate("ffprobe") != nil,
+              let probe = try? await Tools.capture("ffprobe", ["-v", "error", "-select_streams", "a", "-show_entries",
+                                                               "stream=index", "-of", "csv=p=0", source.path])
+        else { return nil }
+        return !probe.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
