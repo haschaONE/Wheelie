@@ -281,10 +281,11 @@ final class FileActionsTests: XCTestCase {
     }
 
     func testSafeEntryPaths() {
-        for safe in ["a.txt", "dir/", "dir/sub/file", "./a", "a..b", "..hidden", "dir/..x"] {
+        for safe in ["a.txt", "dir/", "dir/sub/file", "./a", "a..b", "..hidden", "dir/..x",
+                     "~$Budget.xlsx", "~notes.txt", "~dir/x", "dir/~"] {
             XCTAssertTrue(ArchiveExtractor.isSafeEntryPath(safe), safe)
         }
-        for unsafe in ["../a", "dir/../../a", "/etc/passwd", "a/..", "..", "..\\evil.txt", "~/x"] {
+        for unsafe in ["../a", "dir/../../a", "/etc/passwd", "a/..", "..", "..\\evil.txt", "~/x", "~", "~/"] {
             XCTAssertFalse(ArchiveExtractor.isSafeEntryPath(unsafe), unsafe)
         }
     }
@@ -452,6 +453,216 @@ final class FileActionsTests: XCTestCase {
         XCTAssertEqual(try stagingLeftovers(in: dir), [])
     }
 
+    /// Windows Explorer / 7-Zip: `Bericht/Übersicht.txt` stored in CP437/CP850 (Ü = 0x9A, ß = 0xE1)
+    /// without the UTF-8 flag. bsdtar can't create those raw bytes as names, so we retry as CP437.
+    func testExtractsWindowsZipWithOEMCodePageNames() async throws {
+        let dir = try fileActionsTempDir()
+        let out = try mkdir(dir, "out")
+        let zip = out.appendingPathComponent("windows.zip")
+        try makeStoredZip(at: zip, rawEntries: [
+            (Data("Bericht/".utf8) + Data([0x9A]) + Data("bersicht.txt".utf8), Data("ue".utf8)),
+            (Data("Bericht/Gro".utf8) + Data([0xE1]) + Data("e.txt".utf8), Data("sz".utf8)),
+            (Data("Bericht/plain.txt".utf8), Data("plain".utf8)),
+            // Top level too: in the C locale `tar -t` lists this as `\232ber.txt`.
+            (Data([0x9A]) + Data("ber.txt".utf8), Data("top".utf8)),
+        ])
+        let folder = try await ArchiveExtractor.extract(zip)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path)
+            .map(\.precomposedStringWithCanonicalMapping).sorted(), ["Bericht", "Über.txt"])
+        let bericht = folder.appendingPathComponent("Bericht")
+        let names = try FileManager.default.contentsOfDirectory(atPath: bericht.path)
+            .map(\.precomposedStringWithCanonicalMapping).sorted()
+        XCTAssertEqual(names, ["Große.txt", "plain.txt", "Übersicht.txt"])
+        XCTAssertEqual(try String(contentsOf: bericht.appendingPathComponent("Übersicht.txt"), encoding: .utf8), "ue")
+        XCTAssertEqual(try stagingLeftovers(in: out), [])
+    }
+
+    /// macOS (ditto, Finder) stores UTF-8 names without the flag: they must not become CP437 mojibake.
+    func testZipWithUnflaggedUTF8NamesKeepsThem() async throws {
+        let dir = try fileActionsTempDir()
+        let out = try mkdir(dir, "out")
+        let zip = out.appendingPathComponent("mac.zip")
+        try makeStoredZip(at: zip, rawEntries: [(Data("Übersicht.txt".utf8), Data("ue".utf8)),
+                                                (Data("b.txt".utf8), Data("b".utf8))])
+        let folder = try await ArchiveExtractor.extract(zip)
+        let names = try FileManager.default.contentsOfDirectory(atPath: folder.path)
+            .map(\.precomposedStringWithCanonicalMapping).sorted()
+        XCTAssertEqual(names, ["b.txt", "Übersicht.txt"])
+    }
+
+    /// bsdtar's listing escapes (C locale): `\\`, C escapes and `\ooo` octal bytes.
+    func testListingEscapesAreDecoded() {
+        XCTAssertEqual(ArchiveExtractor.unescapeListing(#"\303\234bersicht.txt"#), "Übersicht.txt")
+        XCTAssertEqual(ArchiveExtractor.unescapeListing(#"a\\b"#), #"a\b"#)
+        XCTAssertEqual(ArchiveExtractor.unescapeListing(#"new\nline\ttab\177"#), "new\nline\ttab\u{7F}")
+        XCTAssertEqual(ArchiveExtractor.unescapeListing(#"\232ber"#), "\u{FFFD}ber")
+        XCTAssertEqual(ArchiveExtractor.unescapeListing(#"plain\9\"#), #"plain\9\"#)
+        XCTAssertFalse(ArchiveExtractor.isSafeEntryPath(ArchiveExtractor.unescapeListing(#"..\\evil.txt"#)))
+        XCTAssertTrue(ArchiveExtractor.isSafeEntryPath(ArchiveExtractor.unescapeListing(#"\303\234ber/a.txt"#)))
+    }
+
+    /// `y -> .` lets `notes.txt -> y/y/y/../../../x` look harmless lexically (depth 3 then 0), but the
+    /// kernel resolves each `y` first, so the dangling link points three levels up.
+    func testDanglingLinkEscapingThroughDotLinksIsRefused() async throws {
+        let dir = try fileActionsTempDir()
+        let out = try mkdir(dir, "out")
+        let tar = out.appendingPathComponent("evil.tar")
+        try await makeTar(at: tar, [("l", "y", 0o755, "."),
+                                    ("l", "notes.txt", 0o755, "y/y/y/../../../escape-proof.txt")])
+        do {
+            _ = try await ArchiveExtractor.extract(tar)
+            XCTFail("expected link rejection")
+        } catch {
+            XCTAssertEqual(error as? ArchiveError, .linkEscapes("notes.txt"))
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: out.path), ["evil.tar"])
+    }
+
+    func testResolvesInsideFollowsLinksStepByStep() throws {
+        let fm = FileManager.default
+        let dir = try fileActionsTempDir()
+        let root = try mkdir(dir, "bundle")
+        try touch(root, "a.txt")
+        try mkdir(root, "sub")
+        for (name, target) in [("y", "."), ("loop1", "loop2"), ("loop2", "loop1"), ("inside", "y/y/a.txt"),
+                               ("dangling", "sub/missing/new.txt"), ("viaSub", "sub/../y/a.txt"),
+                               ("outByName", "y/../bundle/a.txt"), ("up", "y/y/y/../../../x"),
+                               ("missingUp", "nothing/../../x")] {
+            try fm.createSymbolicLink(atPath: root.appendingPathComponent(name).path, withDestinationPath: target)
+        }
+        let resolved = try XCTUnwrap(realpath(root.path, nil))
+        let real = String(cString: resolved)
+        free(resolved)
+        for good in ["y", "inside", "dangling", "viaSub", "a.txt", "sub"] {
+            XCTAssertTrue(ArchiveExtractor.resolvesInside(good, root: real), good)
+        }
+        // `outByName` stays inside only by leaving the folder and coming back by its current name.
+        for bad in ["loop1", "outByName", "up", "missingUp"] {
+            XCTAssertFalse(ArchiveExtractor.resolvesInside(bad, root: real), bad)
+        }
+        XCTAssertThrowsError(try ArchiveExtractor.verifyContained(root)) { error in
+            guard case .linkEscapes? = error as? ArchiveError else { return XCTFail("\(error)") }
+        }
+    }
+
+    /// An escaping link next to a read-only folder: the refusal must still remove staging, which holds
+    /// unchecked, unflagged content.
+    func testRefusedArchiveWithReadOnlyFolderLeavesNoStaging() async throws {
+        let dir = try fileActionsTempDir()
+        let out = try mkdir(dir, "out")
+        let tar = out.appendingPathComponent("payload.tar")
+        try await makeTar(at: tar, [("d", "Payload.app", 0o555, ""),
+                                    ("f", "Payload.app/run.sh", 0o755, "echo hi"),
+                                    ("l", "l", 0o755, "/etc")])
+        do {
+            _ = try await ArchiveExtractor.extract(tar)
+            XCTFail("expected link rejection")
+        } catch {
+            XCTAssertEqual(error as? ArchiveError, .linkEscapes("l"))
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: out.path), ["payload.tar"])
+    }
+
+    /// bsdtar applies folder modes last, so `sealed/` (mode 000) is unlistable when the check runs.
+    func testLinkInsideUnreadableFolderIsRefused() async throws {
+        let dir = try fileActionsTempDir()
+        let out = try mkdir(dir, "out")
+        let tar = out.appendingPathComponent("sealed.tar")
+        try await makeTar(at: tar, [("d", "sealed", 0o000, ""), ("l", "sealed/home", 0o755, "/Users")])
+        do {
+            _ = try await ArchiveExtractor.extract(tar)
+            XCTFail("expected link rejection")
+        } catch {
+            XCTAssertEqual(error as? ArchiveError, .linkEscapes("sealed/home"))
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: out.path), ["sealed.tar"])
+    }
+
+    /// A harmless unreadable folder is fine and keeps its mode.
+    func testUnreadableFolderWithoutLinksStillExtracts() async throws {
+        let dir = try fileActionsTempDir()
+        let tar = dir.appendingPathComponent("locked.tar")
+        try await makeTar(at: tar, [("d", "sealed", 0o000, ""), ("f", "sealed/a.txt", 0o644, "a"),
+                                    ("f", "b.txt", 0o644, "b")])
+        let folder = try await ArchiveExtractor.extract(tar)
+        var info = stat()
+        XCTAssertEqual(lstat(folder.appendingPathComponent("sealed").path, &info), 0)
+        XCTAssertEqual(info.st_mode & 0o7777, 0)
+        XCTAssertEqual(chmod(folder.appendingPathComponent("sealed").path, 0o755), 0)
+        XCTAssertEqual(try stagingLeftovers(in: dir), [])
+    }
+
+    func testPasswordProtectedZipSaysSo() async throws {
+        let dir = try fileActionsTempDir()
+        let out = try mkdir(dir, "out")
+        let secret = try touch(dir, "s.txt")
+        try Data("secret".utf8).write(to: secret)
+        let zip = out.appendingPathComponent("enc.zip")
+        try await Tools.run("/usr/bin/zip", ["-q", "-j", "-P", "pw", zip.path, secret.path])
+        do {
+            _ = try await ArchiveExtractor.extract(zip)
+            XCTFail("expected encryption error")
+        } catch {
+            XCTAssertEqual(error as? ArchiveError, .encrypted)
+            XCTAssertLessThan(error.localizedDescription.count, 200)
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: out.path), ["enc.zip"])
+    }
+
+    func testToolOutputInErrorsIsCapped() {
+        let flood = String(repeating: "Enter passphrase:", count: 10_000) + " the end"
+        let short = ArchiveExtractor.brief(flood)
+        XCTAssertEqual(short.count, 300)
+        XCTAssertTrue(short.hasSuffix(" the end"))
+        XCTAssertEqual(ArchiveExtractor.brief("tar: bad"), "tar: bad")
+        guard case .unreadable(let detail) = ArchiveExtractor.tarError(String(repeating: "x", count: 5000) + "\nfailed") else {
+            return XCTFail("expected unreadable")
+        }
+        XCTAssertLessThanOrEqual(detail.count, 300)
+        let leftover = ArchiveError.cleanupFailed(folder: ".wheelie-extract-X", reason: "The archive is empty.")
+        XCTAssertTrue(leftover.localizedDescription.hasPrefix("The archive is empty."))
+        XCTAssertTrue(leftover.localizedDescription.contains(".wheelie-extract-X"))
+    }
+
+    func testTopLevelTildeNamesExtract() async throws {
+        let dir = try fileActionsTempDir()
+        let out = try mkdir(dir, "out")
+        let zip = out.appendingPathComponent("budget.zip")
+        try makeStoredZip(at: zip, entries: [("~$Budget.xlsx", Data("lock".utf8)), ("Budget.xlsx", Data("b".utf8)),
+                                             ("~notes.txt", Data("n".utf8))])
+        let folder = try await ArchiveExtractor.extract(zip)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: folder.path).sorted(),
+                       ["Budget.xlsx", "~$Budget.xlsx", "~notes.txt"])
+    }
+
+    /// gunzip exits 2 ("trailing garbage ignored") for a complete stream followed by block padding.
+    func testGzipWithTrailingPaddingExtracts() async throws {
+        let dir = try fileActionsTempDir()
+        let notes = dir.appendingPathComponent("notes.txt")
+        try Data("hello padded gzip".utf8).write(to: notes)
+        let gz = dir.appendingPathComponent("padded.txt.gz")
+        try await ArchiveExtractor.runToFile("/usr/bin/gzip", ["-c", notes.path], output: gz)
+        let compressed = try Data(contentsOf: gz)
+        try (compressed + Data(count: 512)).write(to: gz)
+
+        let out = try await ArchiveExtractor.extract(gz)
+        XCTAssertEqual(out.lastPathComponent, "padded.txt")
+        XCTAssertEqual(try String(contentsOf: out, encoding: .utf8), "hello padded gzip")
+        XCTAssertEqual(try stagingLeftovers(in: dir), [])
+
+        // A truncated stream is still an error.
+        let truncated = dir.appendingPathComponent("cut.txt.gz")
+        try compressed.prefix(compressed.count / 2).write(to: truncated)
+        do {
+            _ = try await ArchiveExtractor.extract(truncated)
+            XCTFail("expected failure")
+        } catch {
+            guard case .unreadable? = error as? ArchiveError else { return XCTFail("\(error)") }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("cut.txt").path))
+        XCTAssertEqual(try stagingLeftovers(in: dir), [])
+    }
+
     // MARK: QR codes
 
     func testOpenableURL() {
@@ -558,17 +769,44 @@ private func sampleTree(in dir: URL) throws {
     try Data("beta".utf8).write(to: sub.appendingPathComponent("b.txt"))
 }
 
+/// Plain tar built with Python's tarfile, so entries can carry any mode or link target.
+/// Each entry: ("d" | "f" | "l", name, mode, file contents or link target).
+private func makeTar(at url: URL, _ entries: [(kind: String, name: String, mode: Int, payload: String)]) async throws {
+    let args = entries.flatMap { [$0.kind, $0.name, String($0.mode, radix: 8), $0.payload] }
+    try await Tools.run("/usr/bin/python3", ["-I", "-c", """
+    import tarfile, io, sys
+    t = tarfile.open(sys.argv[1], 'w', format=tarfile.PAX_FORMAT)
+    a = sys.argv[2:]
+    for k in range(0, len(a), 4):
+        kind, name, mode, payload = a[k:k + 4]
+        i = tarfile.TarInfo(name); i.mode = int(mode, 8)
+        if kind == 'd':
+            i.type = tarfile.DIRTYPE; t.addfile(i)
+        elif kind == 'l':
+            i.type = tarfile.SYMTYPE; i.linkname = payload; t.addfile(i)
+        else:
+            data = payload.encode(); i.size = len(data); t.addfile(i, io.BytesIO(data))
+    t.close()
+    """, url.path] + args)
+}
+
 private func stagingLeftovers(in dir: URL) throws -> [String] {
     try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { $0.hasPrefix(".wheelie-extract-") }
 }
 
 /// Minimal uncompressed zip, so entry names can be anything (including `../`).
 private func makeStoredZip(at url: URL, entries: [(String, Data)]) throws {
+    try makeStoredZip(at: url, rawEntries: entries.map { (Data($0.0.utf8), $0.1) })
+}
+
+/// Same with raw name bytes and no UTF-8 flag (bit 11), like Windows Explorer and 7-Zip write
+/// names that fit the OEM code page, and like macOS ditto writes UTF-8 names.
+private func makeStoredZip(at url: URL, rawEntries entries: [(Data, Data)]) throws {
     var out = Data(), central = Data()
     func u16(_ v: Int, _ d: inout Data) { withUnsafeBytes(of: UInt16(v).littleEndian) { d.append(contentsOf: $0) } }
     func u32(_ v: UInt32, _ d: inout Data) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
-    for (name, data) in entries {
-        let nameData = Data(name.utf8), crc = crc32(data), offset = UInt32(out.count)
+    for (nameData, data) in entries {
+        let crc = crc32(data), offset = UInt32(out.count)
         u32(0x0403_4b50, &out); u16(20, &out); u16(0, &out); u16(0, &out); u16(0, &out); u16(0x21, &out)
         u32(crc, &out); u32(UInt32(data.count), &out); u32(UInt32(data.count), &out)
         u16(nameData.count, &out); u16(0, &out)
