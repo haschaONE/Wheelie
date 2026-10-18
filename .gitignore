@@ -1,3 +1,7 @@
 build/
 .build/
 .claude/
+.swiftpm/
+.DS_Store
+*.xcuserstate
+xcuserdata/
