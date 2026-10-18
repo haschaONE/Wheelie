@@ -1,6 +1,9 @@
 import AppKit
 import Carbon.HIToolbox
+import OSLog
 import WheelieCore
+
+private let log = Logger(subsystem: "local.wheelie.Wheelie", category: "drag")
 
 /// Detects file drags started in any app by polling global input state, the
 /// same approach Tangerine's DragGestureMonitor uses: no event taps, no
@@ -11,7 +14,8 @@ import WheelieCore
 /// - While the button is held it polls fast; a changed count with file URLs on
 ///   the drag pasteboard means a file drag is in progress.
 /// - A wheel opens when one of its keys is tapped during
-///   that drag; tapping another wheel's key switches wheels until the drop.
+///   that drag, is held when the drag begins, or was tapped just before it;
+///   tapping another wheel's key switches wheels until the drop.
 @MainActor
 final class DragMonitor {
     /// A wheel key was tapped during a file drag (or was already down when the drag began).
@@ -33,6 +37,10 @@ final class DragMonitor {
     /// Files of the drag in progress, read once it's detected; nil while no file drag is active.
     private var dragFiles: [URL]?
     private var previousModifiers: NSEvent.ModifierFlags = []
+    private var modifiersAtMouseDown: NSEvent.ModifierFlags = []
+    /// A wheel key tapped shortly before the drag began still opens that wheel.
+    private var lastTap: (mode: WheelMode, time: TimeInterval)?
+    private let tapGrace: TimeInterval = 0.6
 
     var isRunning: Bool { timer != nil }
 
@@ -75,6 +83,7 @@ final class DragMonitor {
         if buttonDown && !wasPrimaryButtonDown {
             // Baseline from the last idle sample, taken before this press.
             changeCountBeforeMouseDown = lastObservedChangeCount
+            modifiersAtMouseDown = NSEvent.modifierFlags.intersection([.shift, .control, .option, .command])
             triggered = false
             setActive(true)
         }
@@ -84,16 +93,35 @@ final class DragMonitor {
         if buttonDown, dragFiles == nil, let baseline = changeCountBeforeMouseDown, board.changeCount != baseline {
             let urls = (board.readObjects(forClasses: [NSURL.self],
                                           options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
-            if !urls.isEmpty { dragFiles = urls; dragJustStarted = true }
+            if !urls.isEmpty {
+                dragFiles = urls
+                dragJustStarted = true
+                log.notice("file drag detected: \(urls.count) item(s), modifiers \(modifiers.rawValue), at mouse-down \(self.modifiersAtMouseDown.rawValue)")
+            }
         }
+        let newlyPressed = modifiers.subtracting(previousModifiers)
         if buttonDown, let files = dragFiles {
-            // A tap = the key going down after the drag began. Keys already held then (⌘/⇧-click
-            // multi-selection in Finder) don't count until released and pressed again.
-            let pressed = dragJustStarted ? [] : modifiers.subtracting(previousModifiers)
-            if let (_, mode) = triggers.first(where: { pressed.contains($0.0) }) {
+            var mode: WheelMode?
+            if dragJustStarted {
+                // Held when the drag begins counts (press-then-drag), except ⌘ held since the click:
+                // that's Finder's ⌘-click multi-select / ⌘-drag move, not a request for the wheel.
+                let held = modifiers.subtracting(modifiersAtMouseDown.intersection(.command))
+                mode = triggers.first(where: { held.contains($0.0) })?.1
+                if mode == nil, let tap = lastTap, ProcessInfo.processInfo.systemUptime - tap.time <= tapGrace {
+                    mode = tap.mode
+                }
+            } else {
+                // Tapping a key mid-drag opens or switches wheels.
+                mode = triggers.first(where: { newlyPressed.contains($0.0) })?.1
+            }
+            if let mode {
+                log.notice("opening \(mode.rawValue, privacy: .public) wheel")
                 triggered = true
+                lastTap = nil
                 onTrigger?(mode, files, NSEvent.mouseLocation)
             }
+        } else if let mode = triggers.first(where: { newlyPressed.contains($0.0) })?.1 {
+            lastTap = (mode, ProcessInfo.processInfo.systemUptime)
         }
         previousModifiers = modifiers
 
