@@ -2,16 +2,16 @@ import AppKit
 import WheelieCore
 
 // Headless mode for scripting and smoke tests: Wheelie --convert <format> <file>...
-let args = CommandLine.arguments
-if args.count >= 4, args[1] == "--convert" {
-    guard let format = OutputFormat(rawValue: args[2].lowercased()) ?? (args[2].lowercased() == "jpg" ? .jpeg : nil) else {
-        FileHandle.standardError.write(Data("Unknown format \(args[2]). Options: \(OutputFormat.allCases.map(\.rawValue).joined(separator: ", "))\n".utf8))
-        exit(2)
-    }
-    let files = args.dropFirst(3).map { URL(fileURLWithPath: $0).standardizedFileURL }
-    let done = DispatchSemaphore(value: 0)
-    var failed = false
-    Task {
+switch ConvertCommand.parse(CommandLine.arguments) {
+case .app:
+    break
+case .usageError(let message):
+    // Never fall through to the menu-bar app: a script would hang on a second instance.
+    FileHandle.standardError.write(Data((message + "\n").utf8))
+    exit(2)
+case .convert(let format, let files):
+    Task.detached {
+        var failed = false
         for file in files {
             do {
                 for out in try await Converter.convert(file, to: format) { print(out.path) }
@@ -20,10 +20,9 @@ if args.count >= 4, args[1] == "--convert" {
                 FileHandle.standardError.write(Data("\(file.lastPathComponent): \(error.localizedDescription)\n".utf8))
             }
         }
-        done.signal()
+        exit(failed ? 1 : 0)
     }
-    done.wait()
-    exit(failed ? 1 : 0)
+    dispatchMain()   // parks the main thread; the task above ends the process
 }
 
 MainActor.assumeIsolated {

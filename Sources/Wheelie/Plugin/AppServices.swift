@@ -8,7 +8,8 @@ extension Notification.Name {
     /// userInfo["id"]: UUID, ["title"]: String, ["sources"]: [URL]
     static let wheelieJobStarted = Notification.Name("wheelie.jobStarted")
     /// userInfo["id"]: UUID, ["error"]: String? (nil on success),
-    /// ["outcome"]: "outputs" | "message" | "none" (success only), ["urls"]: [URL] (outputs only)
+    /// ["outcome"]: "outputs" | "message" | "none" (success only),
+    /// ["urls"]: [URL] (outputs, or a failed batch's partial outputs)
     static let wheelieJobFinished = Notification.Name("wheelie.jobFinished")
     /// object: String? — id of the wheel item under the cursor (nil when none).
     static let wheelieHighlightChanged = Notification.Name("wheelie.highlightChanged")
@@ -76,9 +77,14 @@ final class AppServices: ObservableObject {
             NotificationCenter.default.post(name: .wheelieJobFinished, object: nil, userInfo: info)
             return .success(outcome)
         } catch {
-            record(HistoryRecord(title: title, sources: sources, error: error.localizedDescription))
-            NotificationCenter.default.post(name: .wheelieJobFinished, object: nil,
-                                            userInfo: ["id": id, "error": error.localizedDescription])
+            // A batch where only some files failed still wrote the others: keep them in
+            // history (so Recent reveals them) and announce them (Float, "Reveal results").
+            let partial = (error as? PartialOutputsError)?.outputs ?? []
+            record(HistoryRecord(title: title, sources: sources, outputs: partial, error: error.localizedDescription))
+            announce(partial)
+            var info: [String: Any] = ["id": id, "error": error.localizedDescription]
+            if !partial.isEmpty { info["urls"] = partial }
+            NotificationCenter.default.post(name: .wheelieJobFinished, object: nil, userInfo: info)
             return .failure(error)
         }
     }

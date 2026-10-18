@@ -10,6 +10,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var panel = WheelPanel(model: model)
     private var statusItem: NSStatusItem!
     private var hideWork: DispatchWorkItem?
+    /// The job the wheel is currently showing progress for. A job only reports into the
+    /// hub while it still owns it, so an older job can't claim a newer one's "working" state.
+    private var wheelJob: UUID?
     private var observers: [AnyCancellable] = []
 
     private var wheelEnabled: Bool {
@@ -86,6 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func showWheel(files: [URL], items: [WheelItem], at point: NSPoint, interactive: Bool) {
         hideWork?.cancel()
+        wheelJob = nil
         model.files = files
         model.items = items
         model.hovered = nil
@@ -120,13 +124,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func perform(_ item: WheelItem, files: [URL]) {
+        let job = UUID()
+        wheelJob = job
         model.phase = .working(item.label)
         model.hovered = item.id
         // Long jobs keep running in the background; the wheel steps aside.
         hideWheel(after: 1.5)
         Task {
             let result = await services.run(item.label, sources: files) { try await item.perform(files) }
-            guard panel.isVisible, model.phase == .working(item.label) else { return }
+            guard wheelJob == job, panel.isVisible, model.phase == .working(item.label) else { return }
+            wheelJob = nil
             switch result {
             case .success(.none):
                 hideWheel()

@@ -141,12 +141,43 @@ final class WheelDropView: NSView {
         return ring == .inner ? model.inner[index] : model.outer[index]
     }
 
+    /// File URLs on the current drag's pasteboard, read once per drag session.
+    private var dragFiles: (sequence: Int, urls: [URL])?
+
+    @MainActor
+    private func draggedFiles(_ sender: NSDraggingInfo) -> [URL] {
+        if let cached = dragFiles, cached.sequence == sender.draggingSequenceNumber { return cached.urls }
+        let urls = (sender.draggingPasteboard.readObjects(forClasses: [NSURL.self],
+                                                          options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+        dragFiles = (sender.draggingSequenceNumber, urls)
+        return urls
+    }
+
+    /// The files a drop on `item` would run it on, or nil when the item doesn't take them.
+    /// The petals were chosen for `model.files`; a different set dragged onto a wheel that
+    /// stays open (Open Files…) must pass the petal's `accepts` too.
+    @MainActor
+    private func dropFiles(for item: WheelItem, _ sender: NSDraggingInfo) -> [URL]? {
+        let urls = draggedFiles(sender)
+        let files = urls.isEmpty ? model.files : urls
+        if files == model.files { return files }
+        return item.accepts(files) ? files : nil
+    }
+
+    /// An operation the drag source allows. With ⌃ or ⌘ held, AppKit narrows the source mask
+    /// to .link / .generic. Never .move: the original always stays where it is.
+    static func operation(allowedBy mask: NSDragOperation) -> NSDragOperation {
+        let preferred: [NSDragOperation] = [.copy, .generic, .link]
+        return preferred.first { mask.contains($0) } ?? .copy
+    }
+
     private func update(_ sender: NSDraggingInfo) -> NSDragOperation {
         MainActor.assumeIsolated {
             guard model.phase == .choosing else { return [] }
-            let target = item(at: sender.draggingLocation)
+            var target = item(at: sender.draggingLocation)
+            if let candidate = target, dropFiles(for: candidate, sender) == nil { target = nil }
             if model.hovered != target?.id { model.hovered = target?.id }
-            return target == nil ? [] : .copy
+            return target == nil ? [] : Self.operation(allowedBy: sender.draggingSourceOperationMask)
         }
     }
 
@@ -161,15 +192,17 @@ final class WheelDropView: NSView {
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        MainActor.assumeIsolated { model.phase == .choosing && item(at: sender.draggingLocation) != nil }
+        MainActor.assumeIsolated {
+            guard model.phase == .choosing, let target = item(at: sender.draggingLocation) else { return false }
+            return dropFiles(for: target, sender) != nil
+        }
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
         MainActor.assumeIsolated {
-            guard let target = item(at: sender.draggingLocation) else { return false }
-            let urls = (sender.draggingPasteboard.readObjects(forClasses: [NSURL.self],
-                                                              options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
-            model.onChoose?(target, urls.isEmpty ? model.files : urls)
+            guard model.phase == .choosing, let target = item(at: sender.draggingLocation),
+                  let files = dropFiles(for: target, sender) else { return false }
+            model.onChoose?(target, files)
             return true
         }
     }
