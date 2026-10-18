@@ -68,7 +68,8 @@ enum AttributedBuilder {
                     style.paragraphSpacingBefore = level <= 2 ? 14 : 10
                     style.paragraphSpacing = 6
                     style.headerLevel = level
-                case .listItem(let ordered, let level):
+                case .listItem(let ordered, let rawLevel):
+                    let level = min(max(rawLevel, 1), 9)
                     let n = counter.next(level: level, ordered: ordered)
                     activeLists = activeLists.filter { $0.key <= level }
                     if n == 1 { activeLists[level] = nil }

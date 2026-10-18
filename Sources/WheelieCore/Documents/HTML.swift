@@ -249,7 +249,7 @@ enum HTMLReader {
             if src.hasPrefix("data:") {
                 image = DataURI.image(src, alt: alt)
             } else {
-                image = resolver?(src).flatMap { DocImage(data: $0, alt: alt, displayWidth: width.flatMap { Double($0) }) }
+                image = resolver?(src).flatMap { DocImage(data: $0, alt: alt, displayWidth: width.flatMap(DocImage.displayWidth)) }
             }
             guard let image else { return }
             let pending = kind
@@ -327,7 +327,8 @@ enum HTMLWriter {
         var openLists: [Bool] = []   // ordered flags; each open list has an open <li>
         func closeList() { body += openLists.removeLast() ? "</li></ol>\n" : "</li></ul>\n" }
         for block in model.blocks {
-            if case .paragraph(let p) = block, case .listItem(let ordered, let level) = p.kind {
+            if case .paragraph(let p) = block, case .listItem(let ordered, let rawLevel) = p.kind {
+                let level = min(max(rawLevel, 1), 9)
                 while openLists.count > level { closeList() }
                 if openLists.count == level {
                     if openLists.last == ordered { body += "</li>\n" } else { closeList() }
@@ -348,12 +349,14 @@ enum HTMLWriter {
             case .paragraph(let p):
                 let align = alignStyle(p.alignment)
                 switch p.kind {
-                case .heading(let level): body += "<h\(level)\(align)>\(inline(p.runs))</h\(level)>\n"
+                case .heading(let rawLevel):
+                    let level = min(max(rawLevel, 1), 6)
+                    body += "<h\(level)\(align)>\(inline(p.runs))</h\(level)>\n"
                 case .quote: body += "<blockquote><p>\(inline(p.runs))</p></blockquote>\n"
                 default: body += "<p\(align)>\(inline(p.runs))</p>\n"
                 }
             case .image(let image):
-                let width = image.displayWidth.map { " width=\"\(Int($0))\"" } ?? ""
+                let width = image.validDisplayWidth.map { " width=\"\(Int(min($0, 100_000)))\"" } ?? ""
                 body += "<figure><img src=\"\(DataURI.string(for: image))\" alt=\"\(escape(image.alt))\"\(width)></figure>\n"
             case .table(let table):
                 body += "<table>\n"

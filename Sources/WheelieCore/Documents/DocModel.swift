@@ -121,10 +121,21 @@ public struct DocImage: Sendable {
         }
     }
 
+    /// A width attribute from a source file ("120", "NaN", "1e30", "-5") as a usable width in points:
+    /// finite and positive, or nil.
+    static func displayWidth(_ text: String) -> Double? {
+        Double(text.trimmingCharacters(in: .whitespaces)).flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+    }
+
+    /// `displayWidth` when it is finite and positive (the property is public and may hold anything).
+    var validDisplayWidth: Double? {
+        displayWidth.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+    }
+
     /// Size in points: the preferred width (if any), else 72 dpi pixels, scaled down to fit the box.
     public func displaySize(maxWidth: Double, maxHeight: Double = .infinity) -> CGSize {
         let aspect = Double(pixelHeight) / Double(max(pixelWidth, 1))
-        var width = min(displayWidth ?? Double(pixelWidth), maxWidth)
+        var width = min(validDisplayWidth ?? Double(pixelWidth), maxWidth)
         if width * aspect > maxHeight { width = maxHeight / aspect }
         return CGSize(width: width, height: width * aspect)
     }

@@ -516,7 +516,7 @@ enum DocxReader {
                 kind = .heading(1)
             } else if styleName.hasPrefix("heading "), let level = Int(styleName.dropFirst(8)) {
                 kind = .heading(min(max(level, 1), 6))
-            } else if let outline, outline < 9 {
+            } else if let outline, (0..<9).contains(outline) {
                 kind = .heading(min(outline + 1, 6))
             } else if styleName.contains("quote") || styleName == "block text" {
                 kind = .quote
@@ -532,9 +532,10 @@ enum DocxReader {
                 ilvl = ilvl ?? resolve(styleId) { $0.numLevel }
             }
             if let numId, numId != 0, case .body = kind {
-                let level = ilvl ?? 0
+                // w:ilvl is 0...8; clamp before adding so "-1" or Int.max can't make an invalid level.
+                let level = min(max(ilvl ?? 0, 0), 8)
                 let ordered = numbering[numId]?[level] ?? false
-                kind = .listItem(ordered: ordered, level: min(level + 1, 9))
+                kind = .listItem(ordered: ordered, level: level + 1)
             }
 
             var alignment = DocAlignment.natural
@@ -726,7 +727,7 @@ enum DocxReader {
         mutating func images(in element: XMLElement) -> [DocImage] {
             var result: [DocImage] = []
             var widthPoints: Double?
-            if let extent = element.descendants("extent").first, let cx = extent.attr("cx").flatMap(Double.init) {
+            if let extent = element.descendants("extent").first, let cx = extent.attr("cx").flatMap(DocImage.displayWidth) {
                 widthPoints = cx / 12700
             }
             let ids = element.descendants("blip").compactMap { $0.attribute(forName: "r:embed")?.stringValue ?? $0.attr("embed") }

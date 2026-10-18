@@ -5,7 +5,7 @@ import Foundation
 enum MarkdownReader {
     static func read(_ url: URL) throws -> DocModel {
         guard let data = try? Data(contentsOf: url) else { throw ConversionError.unreadable(url) }
-        let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+        let text = TextDecoding.decode(data)
         return try parse(text, folder: url.deletingLastPathComponent())
     }
 
@@ -244,7 +244,7 @@ enum MarkdownWriter {
                 case .heading(let level):
                     counter.reset()
                     let text = inline(p.runs).replacingOccurrences(of: "\n", with: " ")
-                    parts.append((String(repeating: "#", count: level) + " " + text, false))
+                    parts.append((String(repeating: "#", count: min(max(level, 1), 6)) + " " + text, false))
                 case .listItem(let ordered, let level):
                     let n = counter.next(level: level, ordered: ordered)
                     let indent = String(repeating: "    ", count: max(0, level - 1))

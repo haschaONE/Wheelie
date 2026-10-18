@@ -22,8 +22,7 @@ enum CSV {
     static func read(_ url: URL) throws -> Sheet {
         guard let data = try? Data(contentsOf: url) else { throw ConversionError.unreadable(url) }
         guard data.count <= 256 * 1024 * 1024 else { throw DocumentError.tooLarge("The spreadsheet is too large to convert.") }
-        var text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1252) ?? String(decoding: data, as: UTF8.self)
-        if text.hasPrefix("\u{FEFF}") { text.removeFirst() }
+        let text = TextDecoding.decode(data)
         let delimiter: Character = url.pathExtension.lowercased() == "tsv" ? "\t" : detectDelimiter(text)
         let rows = try parse(text, delimiter: delimiter)
         return Sheet(name: url.deletingPathExtension().lastPathComponent, rows: rows)
@@ -129,7 +128,11 @@ enum XLSX {
         let date1904 = workbook.rootElement()?.child("workbookPr")?.attr("date1904").map { $0 == "1" || $0 == "true" } ?? false
 
         var sheets: [Sheet] = []
-        var totalCells = 0
+        // Rows are stored densely (empty strings up to each value's column) and every writer pads them
+        // to the sheet's widest row, so the limit applies to the used area (rows × widest row), not to
+        // the number of <c> elements: one value in column XFD per row would otherwise cost 16,384
+        // strings per row from a file of a few bytes per row.
+        var finishedArea = 0
         for (index, element) in (workbook.rootElement()?.child("sheets")?.children("sheet") ?? []).enumerated() {
             let name = element.attr("name") ?? "Sheet\(index + 1)"
             let id = element.attribute(forName: "r:id")?.stringValue ?? element.attr("id") ?? ""
@@ -137,25 +140,41 @@ enum XLSX {
             guard let data = try zip.read(path) else { continue }
             let doc = try XML.document(data, what: "The worksheet")
             var rows: [[String]] = []
-            for row in doc.rootElement()?.child("sheetData")?.children("row") ?? [] {
-                let rowIndex = (row.attr("r").flatMap(Int.init) ?? rows.count + 1) - 1
-                guard rowIndex < 1_048_576 else { continue }
-                while rows.count < rowIndex { rows.append([]) }
-                var cells: [String] = []
-                for cell in row.children("c") {
-                    let column = cell.attr("r").map(columnIndex) ?? cells.count
-                    guard column < 16_384 else { continue }
-                    while cells.count < column { cells.append("") }
-                    cells.append(value(of: cell, shared: shared, dateStyles: dateStyles, date1904: date1904))
-                    totalCells += 1
-                }
-                while let last = cells.last, last.isEmpty { cells.removeLast() }
-                rows.append(cells)
-                guard totalCells <= DocumentLimits.maxTableCells else {
+            var widest = 0
+            func checkArea(rowCount: Int, columns: Int) throws {
+                guard finishedArea + rowCount * max(columns, 1) <= DocumentLimits.maxTableCells else {
                     throw DocumentError.tooLarge("The spreadsheet has too many cells to convert.")
                 }
             }
+            var nextRow = 0
+            for row in doc.rootElement()?.child("sheetData")?.children("row") ?? [] {
+                // r is 1-based; a missing or non-positive one means "the next row".
+                let rowIndex = row.attr("r").flatMap(Int.init).map { $0 > 0 ? $0 - 1 : nextRow } ?? nextRow
+                nextRow = rowIndex + 1
+                guard rowIndex < 1_048_576 else { continue }
+                var cells: [String] = []
+                var nextColumn = 0
+                for cell in row.children("c") {
+                    let column = cell.attr("r").map(columnIndex) ?? nextColumn
+                    nextColumn = column + 1
+                    guard column < 16_384 else { continue }
+                    // Empty (styled-only) cells add nothing: a later value pads up to its column anyway,
+                    // and trailing empties would be trimmed.
+                    let text = value(of: cell, shared: shared, dateStyles: dateStyles, date1904: date1904)
+                    guard !text.isEmpty else { continue }
+                    // Check before materialising anything: padding rows above and padding cells to the left.
+                    try checkArea(rowCount: max(rows.count, rowIndex + 1), columns: max(widest, column + 1))
+                    while cells.count < column { cells.append("") }
+                    cells.append(text)
+                }
+                // Empty rows are only materialised (as cheap empty arrays) when a later row has content.
+                guard !cells.isEmpty else { continue }
+                while rows.count < rowIndex { rows.append([]) }
+                rows.append(cells)
+                widest = max(widest, cells.count)
+            }
             while let last = rows.last, last.isEmpty { rows.removeLast() }
+            finishedArea += rows.count * max(rows.map(\.count).max() ?? 0, 1)
             sheets.append(Sheet(name: name, rows: rows))
         }
         guard !sheets.isEmpty else { throw DocumentError.malformed("The workbook has no readable sheets.") }
@@ -232,6 +251,8 @@ enum XLSX {
         var index = 0
         for c in reference.uppercased() {
             guard let ascii = c.asciiValue, ascii >= 65, ascii <= 90 else { break }
+            // Excel stops at XFD; stop counting long before "ZZZZ…" could overflow.
+            guard index <= 1_000_000 else { break }
             index = index * 26 + Int(ascii - 64)
         }
         return max(index - 1, 0)

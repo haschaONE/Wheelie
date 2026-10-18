@@ -76,6 +76,7 @@ public enum PDFLayout {
 
     private static func render(_ text: NSAttributedString, in context: CGContext, setup: PageSetup, pagesSoFar: Int) throws -> Int {
         let storage = NSTextStorage(attributedString: text)
+        TableRows.unwrapOversized(in: storage, contentSize: setup.contentSize)
         // TextKit writes its own PDF link annotation for every .link it draws. Take the links out first and
         // annotate only the ones LinkPolicy allows, so no javascript:/file:/anchor target reaches the PDF.
         var links: [(range: NSRange, url: URL)] = []
@@ -96,9 +97,12 @@ public enum PDFLayout {
             containers.append(container)
             let range = layout.glyphRange(for: container)
             if NSMaxRange(range) >= layout.numberOfGlyphs { break }
-            // Something taller than a page (giant table row) can never fit: stop instead of looping.
+            // Something taller than a page that TableRows could not unwrap can never fit. Fail loudly
+            // instead of looping forever or writing a PDF that silently ends early.
             emptyStreak = range.length == 0 ? emptyStreak + 1 : 0
-            if emptyStreak >= 3 { break }
+            if emptyStreak >= 3 {
+                throw DocumentError.unsupported("Part of the document is taller than a page and cannot be laid out as a PDF.")
+            }
             if pagesSoFar + containers.count > DocumentLimits.maxPDFPages {
                 throw DocumentError.tooLarge("The document has more than \(DocumentLimits.maxPDFPages) pages.")
             }
@@ -152,5 +156,173 @@ extension NSAttributedString {
             if value != nil { found = true; stop.pointee = true }
         }
         return found
+    }
+}
+
+/// TextKit 1 cannot split a table row across text containers once anything precedes it on the page:
+/// the row is placed on one page and every line past the bottom edge is squashed onto it and never
+/// drawn. Layout tables (an HTML body inside one `<td>`) and long Word cells hit this all the time.
+/// Rows taller than a page are therefore taken out of their table and laid out as ordinary paragraphs
+/// (each cell in turn); the rows around them stay tables.
+enum TableRows {
+    private struct Cell {
+        let block: NSTextTableBlock
+        var range: NSRange
+    }
+
+    private struct Table {
+        let table: NSTextTable
+        var rows: [Int: [Cell]] = [:]
+    }
+
+    /// Returns the number of rows that were unwrapped.
+    @discardableResult
+    static func unwrapOversized(in storage: NSTextStorage, contentSize: CGSize) -> Int {
+        var total = 0
+        // Unwrapping an outer row can expose an oversized row of a nested table: go again.
+        for _ in 0..<4 {
+            let unwrapped = unwrapOnce(in: storage, contentSize: contentSize)
+            total += unwrapped
+            if unwrapped == 0 { break }
+        }
+        return total
+    }
+
+    private static func unwrapOnce(in storage: NSTextStorage, contentSize: CGSize) -> Int {
+        let full = NSRange(location: 0, length: storage.length)
+        var tables: [ObjectIdentifier: Table] = [:]
+        var order: [ObjectIdentifier] = []
+        storage.enumerateAttribute(.paragraphStyle, in: full) { value, range, _ in
+            // The outermost table block owns the paragraph; nested tables are handled on the next pass.
+            guard let style = value as? NSParagraphStyle,
+                  let block = style.textBlocks.lazy.compactMap({ $0 as? NSTextTableBlock }).first else { return }
+            let id = ObjectIdentifier(block.table)
+            if tables[id] == nil {
+                tables[id] = Table(table: block.table)
+                order.append(id)
+            }
+            var cells = tables[id]?.rows[block.startingRow] ?? []
+            if let index = cells.firstIndex(where: { $0.block === block }) {
+                cells[index].range = NSUnionRange(cells[index].range, range)
+            } else {
+                cells.append(Cell(block: block, range: range))
+            }
+            tables[id]?.rows[block.startingRow] = cells
+        }
+        guard !tables.isEmpty else { return 0 }
+
+        // Measure every row in one container as wide as the page and endlessly tall, where no row is cut.
+        let layout = NSLayoutManager()
+        layout.allowsNonContiguousLayout = false
+        let container = NSTextContainer(size: CGSize(width: contentSize.width, height: .greatestFiniteMagnitude))
+        container.lineFragmentPadding = 0
+        layout.addTextContainer(container)
+        storage.addLayoutManager(layout)
+        defer { storage.removeLayoutManager(layout) }
+        layout.ensureLayout(for: container)
+
+        func height(of row: [Cell]) -> CGFloat {
+            var rect = CGRect.null
+            for cell in row {
+                let glyphs = layout.glyphRange(forCharacterRange: cell.range, actualCharacterRange: nil)
+                guard glyphs.length > 0 else { continue }
+                let bounds = layout.boundsRect(for: cell.block, glyphRange: glyphs)
+                if !bounds.isEmpty { rect = rect.union(bounds) }
+                layout.enumerateLineFragments(forGlyphRange: glyphs) { fragment, _, _, _, _ in rect = rect.union(fragment) }
+            }
+            return rect.isNull ? 0 : rect.height
+        }
+
+        // Keep a little room for borders.
+        let limit = contentSize.height - 4
+        // Block → its replacement in the rewritten text: nil drops the block (the row is unwrapped).
+        var replacements: [ObjectIdentifier: NSTextTableBlock?] = [:]
+        var unwrapped = 0
+        for id in order {
+            guard let entry = tables[id] else { continue }
+            let rowNumbers = entry.rows.keys.sorted()
+            let oversized = Set(rowNumbers.filter { height(of: entry.rows[$0] ?? []) > limit })
+            guard !oversized.isEmpty else { continue }
+            unwrapped += oversized.count
+            // Split the table at every oversized row. Each later run of normal rows becomes its own table,
+            // numbered from zero, so TextKit never sees one table interrupted by plain paragraphs.
+            var segment: (table: NSTextTable, firstRow: Int, endRow: Int)?
+            var seenOversized = false
+            for (position, r) in rowNumbers.enumerated() {
+                let cells = entry.rows[r] ?? []
+                if oversized.contains(r) {
+                    for cell in cells { replacements[ObjectIdentifier(cell.block)] = .some(nil) }
+                    segment = nil
+                    seenOversized = true
+                    continue
+                }
+                guard seenOversized else { continue }
+                if segment == nil {
+                    let end = rowNumbers[position...].first { oversized.contains($0) } ?? Int.max
+                    segment = (copy(entry.table), r, end)
+                }
+                guard let current = segment else { continue }
+                for cell in cells {
+                    let span = max(1, min(cell.block.rowSpan, current.endRow - r))
+                    replacements[ObjectIdentifier(cell.block)] = .some(copy(cell.block, table: current.table,
+                                                                            row: r - current.firstRow, rowSpan: span))
+                }
+            }
+        }
+        guard !replacements.isEmpty else { return 0 }
+
+        storage.beginEditing()
+        storage.enumerateAttribute(.paragraphStyle, in: full) { value, range, _ in
+            guard let style = value as? NSParagraphStyle,
+                  style.textBlocks.contains(where: { replacements[ObjectIdentifier($0)] != nil }),
+                  let mutable = style.mutableCopy() as? NSMutableParagraphStyle else { return }
+            mutable.textBlocks = style.textBlocks.compactMap { block in
+                guard let replacement = replacements[ObjectIdentifier(block)] else { return block }
+                return replacement
+            }
+            // Cells laid out one after another need a little air between them.
+            if mutable.textBlocks.isEmpty, style.paragraphSpacing < 4 { mutable.paragraphSpacing = 4 }
+            storage.addAttribute(.paragraphStyle, value: mutable, range: range)
+        }
+        storage.endEditing()
+        return unwrapped
+    }
+
+    private static let dimensions: [NSTextBlock.Dimension] = [.width, .minimumWidth, .maximumWidth, .height, .minimumHeight, .maximumHeight]
+    private static let layers: [NSTextBlock.Layer] = [.padding, .border, .margin]
+    private static let edges: [NSRectEdge] = [.minX, .minY, .maxX, .maxY]
+
+    private static func copyAppearance(from source: NSTextBlock, to target: NSTextBlock) {
+        for dimension in dimensions {
+            target.setValue(source.value(for: dimension), type: source.valueType(for: dimension), for: dimension)
+        }
+        for layer in layers {
+            for edge in edges {
+                target.setWidth(source.width(for: layer, edge: edge), type: source.widthValueType(for: layer, edge: edge),
+                                for: layer, edge: edge)
+            }
+        }
+        for edge in edges {
+            if let color = source.borderColor(for: edge) { target.setBorderColor(color, for: edge) }
+        }
+        target.backgroundColor = source.backgroundColor
+        target.verticalAlignment = source.verticalAlignment
+    }
+
+    private static func copy(_ table: NSTextTable) -> NSTextTable {
+        let result = NSTextTable()
+        result.numberOfColumns = table.numberOfColumns
+        result.layoutAlgorithm = table.layoutAlgorithm
+        result.collapsesBorders = table.collapsesBorders
+        result.hidesEmptyCells = table.hidesEmptyCells
+        copyAppearance(from: table, to: result)
+        return result
+    }
+
+    private static func copy(_ block: NSTextTableBlock, table: NSTextTable, row: Int, rowSpan: Int) -> NSTextTableBlock {
+        let result = NSTextTableBlock(table: table, startingRow: row, rowSpan: rowSpan,
+                                      startingColumn: block.startingColumn, columnSpan: block.columnSpan)
+        copyAppearance(from: block, to: result)
+        return result
     }
 }

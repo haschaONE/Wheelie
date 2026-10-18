@@ -24,9 +24,7 @@ enum DocumentConverter {
             // Keep the old behaviour as a fallback when reflow refuses (e.g. copy-protected PDFs).
             do { return [try write(try load(source, kind: kind), source: source, to: format)] } catch {
                 guard let doc = PDFKitText.string(source) else { throw error }
-                let output = OutputNaming.uniqueURL(for: source, ext: "txt")
-                try doc.write(to: output, atomically: true, encoding: .utf8)
-                return [output]
+                return [try produce(source, ext: "txt") { try doc.write(to: $0, atomically: true, encoding: .utf8) }]
             }
         }
         return [try write(try load(source, kind: kind), source: source, to: format)]
@@ -52,7 +50,7 @@ enum DocumentConverter {
         case "txt", "text":
             guard let data = try? Data(contentsOf: source) else { throw ConversionError.unreadable(source) }
             guard data.count <= DocumentLimits.maxTextCharacters else { throw DocumentError.tooLarge("The document text exceeds the conversion limit.") }
-            let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .windowsCP1252) ?? ""
+            let text = TextDecoding.decode(data)
             return Loaded(model: DocModel.fromPlainText(text))
         case "docx", "docm", "dotx":
             do {
@@ -93,7 +91,7 @@ enum DocumentConverter {
     // MARK: Writing
 
     static func write(_ loaded: Loaded, source: URL, to format: OutputFormat) throws -> URL {
-        let output = OutputNaming.uniqueURL(for: source, ext: format.fileExtension)
+        let output = try OutputNaming.reserveURL(for: source, ext: format.fileExtension)
         var model = loaded.model
         if model.title == nil { model.title = source.deletingPathExtension().lastPathComponent }
         let setup = PDFLayout.PageSetup.current
@@ -163,6 +161,19 @@ enum DocumentConverter {
         return copy
     }
 
+    /// Reserves the output name (see `OutputNaming.reserveURL`), lets `body` write the file and removes
+    /// the placeholder again when that fails.
+    static func produce(_ source: URL, ext: String, suffix: String = "", _ body: (URL) throws -> Void) throws -> URL {
+        let output = try OutputNaming.reserveURL(for: source, ext: ext, suffix: suffix)
+        do {
+            try body(output)
+        } catch {
+            try? FileManager.default.removeItem(at: output)
+            throw error
+        }
+        return output
+    }
+
     // MARK: Spreadsheets
 
     static func readSheets(_ source: URL) throws -> [Sheet] {
@@ -179,32 +190,32 @@ enum DocumentConverter {
         case .csv:
             let nonEmpty = sheets.filter { !$0.rows.isEmpty }
             let list = nonEmpty.isEmpty ? Array(sheets.prefix(1)) : nonEmpty
-            return try list.map { sheet in
-                let suffix = list.count > 1 ? " - " + sheet.name.replacingOccurrences(of: "/", with: "-") : ""
-                let output = OutputNaming.uniqueURL(for: source, ext: "csv", suffix: suffix)
-                try CSV.write(sheet).write(to: output, atomically: true, encoding: .utf8)
-                return output
+            var outputs: [URL] = []
+            do {
+                for sheet in list {
+                    let suffix = list.count > 1 ? " - " + sheet.name.replacingOccurrences(of: "/", with: "-") : ""
+                    outputs.append(try produce(source, ext: "csv", suffix: suffix) {
+                        try CSV.write(sheet).write(to: $0, atomically: true, encoding: .utf8)
+                    })
+                }
+            } catch {
+                for output in outputs { try? FileManager.default.removeItem(at: output) }
+                throw error
             }
+            return outputs
         case .xlsx:
-            let output = OutputNaming.uniqueURL(for: source, ext: "xlsx")
-            try XLSX.write(sheets, to: output)
-            return [output]
+            return [try produce(source, ext: "xlsx") { try XLSX.write(sheets, to: $0) }]
         case .html:
             var blocks: [DocBlock] = []
             for sheet in sheets {
                 if sheets.count > 1 { blocks.append(.paragraph(DocParagraph(.heading(2), runs: [DocRun(sheet.name)]))) }
                 if !sheet.rows.isEmpty { blocks.append(.table(sheet.table)) }
             }
-            let output = OutputNaming.uniqueURL(for: source, ext: "html")
-            try HTMLWriter.render(DocModel(title: title, blocks: blocks)).write(to: output, atomically: true, encoding: .utf8)
-            return [output]
+            return [try produce(source, ext: "html") {
+                try HTMLWriter.render(DocModel(title: title, blocks: blocks)).write(to: $0, atomically: true, encoding: .utf8)
+            }]
         case .pdf:
-            let output = OutputNaming.uniqueURL(for: source, ext: "pdf")
-            do { try TablePDF.write(sheets, to: output, title: title) } catch {
-                try? FileManager.default.removeItem(at: output)
-                throw error
-            }
-            return [output]
+            return [try produce(source, ext: "pdf") { try TablePDF.write(sheets, to: $0, title: title) }]
         default:
             throw ConversionError.unsupported(.spreadsheet, format)
         }
@@ -220,9 +231,16 @@ enum DocumentConverter {
         func direct(_ format: OutputFormat) async throws -> URL {
             guard let (filter, ext) = LibreOffice.filter(for: format) else { throw ConversionError.unsupported(kind, format) }
             let produced = try await LibreOffice.convert(source, filter: filter, ext: ext, workDirectory: work)
-            let output = OutputNaming.uniqueURL(for: source, ext: format.fileExtension)
-            try FileManager.default.moveItem(at: produced, to: output)
-            return output
+            return try produce(source, ext: format.fileExtension) { output in
+                // Stage next to the reserved placeholder (moveItem copies across volumes), then rename(2)
+                // over it: atomic, and the name stays ours the whole time.
+                let staged = output.deletingLastPathComponent().appendingPathComponent(".wheelie-\(UUID().uuidString).\(ext)")
+                try FileManager.default.moveItem(at: produced, to: staged)
+                guard rename(staged.path, output.path) == 0 else {
+                    try? FileManager.default.removeItem(at: staged)
+                    throw ConversionError.writeFailed(output)
+                }
+            }
         }
 
         switch kind {

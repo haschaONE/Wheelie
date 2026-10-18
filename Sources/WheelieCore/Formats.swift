@@ -122,7 +122,7 @@ public enum OutputFormat: String, CaseIterable, Sendable, Identifiable {
     /// Every target a kind can be converted to, most useful first (before availability checks).
     static func ranked(for kind: FileKind) -> [OutputFormat] {
         switch kind {
-        case .image: return [.png, .jpeg, .heic, .webp, .pdf, .avif, .tiff, .gif, .ico, .icns, .bmp]
+        case .image: return [.png, .jpeg, .heic, .webp, .pdf, .avif, .tiff, .gif, .bmp, .ico, .icns]
         case .video: return [.mp4, .mov, .gif, .webm, .mkv, .mp3, .m4a, .wav, .avi]
         case .audio: return [.mp3, .m4a, .wav, .flac, .aiff, .opus]
         case .pdf: return [.docx, .png, .jpeg, .txt, .markdown, .html, .rtf, .odt]
@@ -131,6 +131,24 @@ public enum OutputFormat: String, CaseIterable, Sendable, Identifiable {
         case .spreadsheet: return [.pdf, .xlsx, .csv, .html]
         case .presentation: return [.pdf, .png, .jpeg]
         case .unknown: return []
+        }
+    }
+
+    /// Image targets ordered for the source, so the `maxPetals` cut drops what that source least needs
+    /// (there are more image targets than petals): photos lose ICNS, icon sources (PNG/ICO/ICNS) lose BMP,
+    /// vector SVG loses GIF/BMP, and animated GIF (plus MP4/WebM) loses HEIC/TIFF/BMP. Every target stays
+    /// reachable from some common source.
+    static func imageRanking(for ext: String) -> [OutputFormat] {
+        switch ext {
+        case "png", "ico", "icns":
+            return [.png, .jpeg, .heic, .webp, .pdf, .avif, .ico, .icns, .tiff, .gif, .bmp]
+        case "svg", "svgz":
+            return [.png, .jpeg, .pdf, .ico, .icns, .webp, .heic, .avif, .tiff, .gif, .bmp]
+        case "gif":
+            // Animated GIF → video is the common request; offer it right after the stills.
+            return [.png, .jpeg, .mp4, .webm, .webp, .avif, .pdf, .ico, .icns, .gif, .heic, .tiff, .bmp]
+        default:
+            return ranked(for: .image)
         }
     }
 
@@ -156,9 +174,8 @@ public enum OutputFormat: String, CaseIterable, Sendable, Identifiable {
         if LibreOffice.requiredExtensions.contains(ext) && !LibreOffice.isInstalled { return [] }
         var list = ranked(for: kind).filter(\.isAvailable)
         switch kind {
-        case .image where ext == "gif":
-            // Animated GIF → video is the common request; offer it right after the stills.
-            list.insert(contentsOf: [.mp4, .webm], at: 2)
+        case .image:
+            list = imageRanking(for: ext).filter(\.isAvailable)
         case .spreadsheet where ["csv", "tsv"].contains(ext):
             list = [.pdf, .xlsx, .html, .csv]
         default:

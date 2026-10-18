@@ -52,7 +52,7 @@ enum PDFReflow {
                 // Scanned page: OCR it, else keep the page as a picture.
                 lines = recognizeText ? recognize(page, index: index) : []
                 if lines.isEmpty {
-                    if let image = try? Converter.render(page, scale: 2), let docImage = DocImage(cgImage: image, jpeg: true) {
+                    if let image = try? Converter.render(page, scale: 2, box: .mediaBox), let docImage = DocImage(cgImage: image, jpeg: true) {
                         var docImage = docImage
                         docImage.displayWidth = Double(page.bounds(for: .mediaBox).width)
                         items.append(.image(docImage))
@@ -139,7 +139,7 @@ enum PDFReflow {
     // MARK: OCR
 
     static func recognize(_ page: PDFPage, index: Int) -> [Line] {
-        guard let image = try? Converter.render(page, scale: 2) else { return [] }
+        guard let image = try? Converter.render(page, scale: 2, box: .mediaBox) else { return [] }
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
@@ -167,6 +167,7 @@ enum PDFReflow {
         let scanner = ImageScanner()
         let stream = CGPDFContentStreamCreateWithPage(cgPage)
         scanner.scan(stream, depth: 0)
+        CGPDFContentStreamRelease(stream)
         return scanner.rects
     }
 
@@ -404,6 +405,9 @@ private final class ImageScanner {
     private var stack: [CGAffineTransform] = [.identity]
     private var depth = 0
     private var operations = 0
+    /// Stack depth the current content stream started at. Unbalanced `Q`s inside a
+    /// Form XObject (or the page) must never pop state that belongs to an outer stream.
+    private var base = 1
 
     private static let table: CGPDFOperatorTableRef = {
         let table = CGPDFOperatorTableCreate()!
@@ -412,7 +416,7 @@ private final class ImageScanner {
             scanner.stack.append(scanner.stack.last ?? .identity)
         }
         CGPDFOperatorTableSetCallback(table, "Q") { _, info in
-            guard let scanner = ImageScanner.from(info), scanner.stack.count > 1 else { return }
+            guard let scanner = ImageScanner.from(info), scanner.stack.count > scanner.base else { return }
             scanner.stack.removeLast()
         }
         CGPDFOperatorTableSetCallback(table, "cm") { pdfScanner, info in
@@ -424,7 +428,8 @@ private final class ImageScanner {
                 values[i] = value
             }
             let matrix = CGAffineTransform(a: values[0], b: values[1], c: values[2], d: values[3], tx: values[4], ty: values[5])
-            scanner.stack[scanner.stack.count - 1] = matrix.concatenating(scanner.stack.last ?? .identity)
+            let current = scanner.stack.popLast() ?? .identity
+            scanner.stack.append(matrix.concatenating(current))
         }
         CGPDFOperatorTableSetCallback(table, "Do") { pdfScanner, info in
             guard let scanner = ImageScanner.from(info) else { return }
@@ -451,12 +456,21 @@ private final class ImageScanner {
                 }
                 var resources: CGPDFDictionaryRef?
                 _ = CGPDFDictionaryGetDictionary(dictionary, "Resources", &resources)
+                // The form gets its own frame: [outer stack…, form matrix]. Its `Q`s may not
+                // pop below that frame, and whatever it leaves behind (extra `q`s) is cut off.
+                let outerBase = scanner.base
+                let outerCount = scanner.stack.count
                 scanner.stack.append(matrix.concatenating(ctm))
+                scanner.base = scanner.stack.count
                 let formStream = CGPDFContentStreamCreateWithStream(stream, resources ?? dictionary, contentStream)
                 scanner.depth += 1
                 scanner.scan(formStream, depth: scanner.depth)
+                CGPDFContentStreamRelease(formStream)
                 scanner.depth -= 1
-                scanner.stack.removeLast()
+                scanner.base = outerBase
+                if scanner.stack.count > outerCount {
+                    scanner.stack.removeLast(scanner.stack.count - outerCount)
+                }
             default:
                 break
             }

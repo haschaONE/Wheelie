@@ -45,7 +45,7 @@ public enum Converter {
     // MARK: Images
 
     static func convertImage(_ source: URL, to format: OutputFormat) async throws -> URL {
-        let output = OutputNaming.uniqueURL(for: source, ext: format.fileExtension)
+        let output = try OutputNaming.reserveURL(for: source, ext: format.fileExtension)
         do {
             try await writeImageFormat(source, to: output, format: format)
         } catch {
@@ -271,20 +271,32 @@ public enum Converter {
     /// rendered to a temporary PDF still get "Slides-p1.png").
     static func convertPDF(_ source: URL, to format: OutputFormat, naming: URL? = nil) throws -> [URL] {
         guard let doc = PDFDocument(url: source) else { throw ConversionError.unreadable(source) }
+        // A locked PDF still reports its pages but renders them blank: open it with the empty
+        // password (owner-password-only files) or refuse.
+        if doc.isLocked && !doc.unlock(withPassword: "") {
+            throw DocumentError.unreadable("The PDF is password-protected.")
+        }
         let name = naming ?? source
         var outputs: [URL] = []
-        for index in 0..<doc.pageCount {
-            guard let page = doc.page(at: index) else { continue }
-            let suffix = doc.pageCount > 1 ? "-p\(index + 1)" : ""
-            let output = OutputNaming.uniqueURL(for: name, ext: format.fileExtension, suffix: suffix)
-            try writeImage(try render(page, scale: 2), to: output, type: utType(for: format))
-            outputs.append(output)
+        do {
+            for index in 0..<doc.pageCount {
+                guard let page = doc.page(at: index) else { continue }
+                let suffix = doc.pageCount > 1 ? "-p\(index + 1)" : ""
+                let output = try OutputNaming.reserveURL(for: name, ext: format.fileExtension, suffix: suffix)
+                outputs.append(output)
+                try writeImage(try render(page, scale: 2), to: output, type: utType(for: format))
+            }
+        } catch {
+            for output in outputs { try? FileManager.default.removeItem(at: output) }
+            throw error
         }
         return outputs
     }
 
-    static func render(_ page: PDFPage, scale: CGFloat) throws -> CGImage {
-        let bounds = page.bounds(for: .mediaBox)
+    /// Renders the page as viewers show it: the crop box (what Preview's Crop tool sets), with its rotation.
+    /// PDF reflow passes `.mediaBox` because its text geometry is in media-box space.
+    static func render(_ page: PDFPage, scale: CGFloat, box: PDFDisplayBox = .cropBox) throws -> CGImage {
+        let bounds = page.bounds(for: box)
         let rotated = page.rotation % 180 != 0
         let size = CGSize(width: (rotated ? bounds.height : bounds.width) * scale,
                           height: (rotated ? bounds.width : bounds.height) * scale)
@@ -295,23 +307,27 @@ public enum Converter {
         ctx.setFillColor(.white)
         ctx.fill(CGRect(origin: .zero, size: size))
         ctx.scaleBy(x: scale, y: scale)
-        page.draw(with: .mediaBox, to: ctx)
+        page.draw(with: box, to: ctx)
         guard let image = ctx.makeImage() else { throw ConversionError.writeFailed(URL(fileURLWithPath: "page")) }
         return image
     }
 
     // MARK: Video / audio (ffmpeg)
 
+    /// libx264 with 4:2:0 chroma rejects odd widths/heights (853×480 web videos, VP9/ProRes screen
+    /// recordings). Pad by at most one pixel instead of failing; a no-op for even sizes.
+    static let evenDimensions = ["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"]
+
     static func ffmpegArguments(for format: OutputFormat) -> [String] {
         switch format {
         case .mp4, .mov:
-            return ["-c:v", "libx264", "-crf", "23", "-preset", "medium", "-pix_fmt", "yuv420p",
+            return ["-c:v", "libx264", "-crf", "23", "-preset", "medium"] + evenDimensions + ["-pix_fmt", "yuv420p",
                     "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"]
         case .webm:
             return ["-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-row-mt", "1", "-c:a", "libopus", "-b:a", "128k"]
         case .mkv:
-            return ["-map", "0:v:0?", "-map", "0:a?", "-c:v", "libx264", "-crf", "20", "-preset", "medium", "-pix_fmt", "yuv420p",
-                    "-c:a", "aac", "-b:a", "192k"]
+            return ["-map", "0:v:0?", "-map", "0:a?", "-c:v", "libx264", "-crf", "20", "-preset", "medium"] + evenDimensions
+                + ["-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k"]
         case .avi:
             return ["-c:v", "mpeg4", "-q:v", "3", "-tag:v", "XVID", "-pix_fmt", "yuv420p", "-c:a", "libmp3lame", "-q:a", "3"]
         case .gif:
@@ -337,7 +353,7 @@ public enum Converter {
     }
 
     static func convertMedia(_ source: URL, to format: OutputFormat) async throws -> URL {
-        let output = OutputNaming.uniqueURL(for: source, ext: format.fileExtension)
+        let output = try OutputNaming.reserveURL(for: source, ext: format.fileExtension)
         let input = ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", source.path]
         do {
             if FileKind(url: source) == .image {
