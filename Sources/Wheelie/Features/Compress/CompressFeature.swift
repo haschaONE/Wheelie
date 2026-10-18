@@ -41,7 +41,7 @@ enum CompressFeature: WheelieFeature {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
-        panel.allowedContentTypes = [.image, .audiovisualContent, .pdf]
+        panel.allowedContentTypes = CompressInputs.contentTypes
         panel.message = message
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK else { return }
@@ -52,6 +52,46 @@ enum CompressFeature: WheelieFeature {
     /// One window per tool and file set, so dropping the same files again focuses it.
     static func windowID(_ tool: String, _ files: [URL]) -> String {
         "compress.\(tool):" + files.map(\.path).joined(separator: "|")
+    }
+}
+
+/// Ties a window's job to that one window. Closing the window (Cancel, Esc, ⌘W, the close button)
+/// cancels the job, which also stops its ffmpeg/cwebp process. The job's own auto-close only ever
+/// closes the window it ran in: window ids repeat when the same files are opened again.
+@MainActor
+final class WindowJob {
+    private weak var window: NSWindow?
+    private var observer: NSObjectProtocol?
+    private var task: Task<Void, Never>?
+
+    /// Call with the window the view was presented in (only when it was newly created).
+    func attach(to window: NSWindow) {
+        self.window = window
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window,
+                                                          queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.windowWillClose() }
+        }
+    }
+
+    /// Runs `work` as this window's job; ignored while one is already running.
+    func start(_ work: @escaping @MainActor () async -> Void) {
+        guard task == nil else { return }
+        task = Task { [weak self] in
+            await work()
+            self?.task = nil
+        }
+    }
+
+    func cancel() { task?.cancel() }
+
+    /// Closes the window this job belongs to, never another one that reuses its id.
+    func closeOwnWindow() { window?.close() }
+
+    private func windowWillClose() {
+        cancel()
+        if let observer { NotificationCenter.default.removeObserver(observer) }
+        observer = nil
     }
 }
 

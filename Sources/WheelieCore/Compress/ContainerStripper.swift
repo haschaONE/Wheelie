@@ -81,6 +81,65 @@ enum ContainerStripper {
         return nil   // no end-of-image marker: let the caller fall back to re-encoding
     }
 
+    /// Byte ranges of a JPEG that hold metadata: the payloads of every segment `stripJPEG` drops,
+    /// the JFIF thumbnail (from its size fields on) and anything after the end-of-image marker.
+    /// Ranges that are already all zero are left out, so an empty result means "nothing left".
+    /// Tolerant of a missing end-of-image marker (common for JPEGs embedded in PDFs).
+    static func jpegMetadataRanges(_ b: [UInt8]) -> [Range<Int>] {
+        guard b.count > 4, b[0] == 0xFF, b[1] == 0xD8 else { return [] }
+        var ranges: [Range<Int>] = []
+        var i = 2
+        while i + 1 < b.count, b[i] == 0xFF {
+            let marker = b[i + 1]
+            if marker == 0xFF { i += 1; continue }
+            if marker == 0xD9 {
+                if i + 2 < b.count { ranges.append((i + 2)..<b.count) }
+                break
+            }
+            if marker == 0x01 || (0xD0...0xD7).contains(marker) { i += 2; continue }
+            guard i + 3 < b.count else { break }
+            let length = Int(b[i + 2]) << 8 | Int(b[i + 3])
+            guard length >= 2, i + 2 + length <= b.count else { break }
+            let start = i + 4, end = i + 2 + length
+            func starts(with prefix: String) -> Bool { b[start..<end].starts(with: Array(prefix.utf8)) }
+
+            switch marker {
+            case 0xE0:
+                if !starts(with: "JFIF\0") { ranges.append(start..<end) } else if end - start > 12 { ranges.append((start + 12)..<end) }
+            case 0xE2 where starts(with: "ICC_PROFILE\0"), 0xEE where starts(with: "Adobe"):
+                break
+            case 0xE1...0xEF, 0xFE:
+                ranges.append(start..<end)
+            default:
+                break
+            }
+            i = end
+
+            if marker == 0xDA {
+                while i + 1 < b.count {
+                    if b[i] == 0xFF {
+                        let next = b[i + 1]
+                        if next == 0x00 || (0xD0...0xD7).contains(next) { i += 2; continue }
+                        break
+                    }
+                    i += 1
+                }
+            }
+        }
+        return ranges.filter { range in b[range].contains { $0 != 0 } }
+    }
+
+    /// Same-length copy of a JPEG with every metadata range zeroed: the segments stay (as empty
+    /// padding) so the image data keeps its byte offsets. Returns nil when there is nothing to blank.
+    /// Used where bytes can't move, such as JPEG streams inside a PDF.
+    static func blankJPEGMetadata(_ data: Data) -> Data? {
+        var b = [UInt8](data)
+        let ranges = jpegMetadataRanges(b)
+        guard !ranges.isEmpty else { return nil }
+        for range in ranges { b.replaceSubrange(range, with: repeatElement(0, count: range.count)) }
+        return Data(b)
+    }
+
     // MARK: PNG
 
     /// Image data, color and animation chunks; text (tEXt/zTXt/iTXt), eXIf, tIME and private chunks are dropped.

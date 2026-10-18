@@ -42,6 +42,7 @@ public enum MetadataStripper {
         // Last line of defence: nothing identifying may survive.
         let leftovers = await MetadataReader.read(temp).filter { [.camera, .location, .people].contains($0.category) }
         guard leftovers.isEmpty else { throw MetadataError.leftover }
+        try Task.checkCancellation()
 
         let output = OutputNaming.uniqueURL(for: source, ext: ext, suffix: " clean", in: outputDirectory)
         try FileManager.default.moveItem(at: temp, to: output)
@@ -174,26 +175,38 @@ public enum MetadataStripper {
 
     // MARK: PDF
 
+    /// Document info, catalog XMP, annotation authors/edit times, and the EXIF/GPS/XMP that placed
+    /// photos (JPEG streams), pages and forms carry. Fails closed if any of it can't be removed.
     static func stripPDF(_ source: URL, to output: URL) throws {
         guard let doc = PDFDocument(url: source), !doc.isLocked else { throw CompressionError.pdfLocked }
         let pages = doc.pageCount
         doc.documentAttributes = [:]
+        PDFEmbeddedMetadata.scrubAnnotations(doc)
         guard doc.write(to: output) else { throw MetadataError.pdfFailed }
-        if let check = PDFDocument(url: output), check.pageCount == pages, !MetadataReader.hasXMP(check) { return }
 
-        // Rebuild from page copies if the catalog kept its XMP packet.
-        try? FileManager.default.removeItem(at: output)
-        let fresh = PDFDocument()
-        for index in 0..<pages {
-            guard let page = doc.page(at: index)?.copy() as? PDFPage else { throw MetadataError.pdfFailed }
-            fresh.insert(page, at: index)
+        if !(PDFDocument(url: output).map { $0.pageCount == pages && !MetadataReader.hasXMP($0) } ?? false) {
+            // Rebuild from page copies if the catalog kept its XMP packet.
+            try? FileManager.default.removeItem(at: output)
+            let fresh = PDFDocument()
+            for index in 0..<pages {
+                guard let page = doc.page(at: index)?.copy() as? PDFPage else { throw MetadataError.pdfFailed }
+                fresh.insert(page, at: index)
+            }
+            fresh.documentAttributes = [:]
+            guard fresh.write(to: output) else { throw MetadataError.pdfFailed }
         }
-        fresh.documentAttributes = [:]
-        guard fresh.write(to: output), let check = PDFDocument(url: output), check.pageCount == pages,
-              !MetadataReader.hasXMP(check)
-        else {
+
+        // PDFKit writes image and XMP streams through unchanged: blank their metadata in place.
+        try PDFEmbeddedMetadata.scrubStreams(in: output)
+
+        guard let check = PDFDocument(url: output), check.pageCount == pages, !MetadataReader.hasXMP(check) else {
             try? FileManager.default.removeItem(at: output)
             throw MetadataError.pdfFailed
+        }
+        // Streams stored compressed or encrypted can't be patched in place; never deliver them as clean.
+        guard PDFEmbeddedMetadata.annotationAuthors(check).isEmpty, !PDFEmbeddedMetadata.hasLeftovers(in: output) else {
+            try? FileManager.default.removeItem(at: output)
+            throw MetadataError.leftover
         }
     }
 

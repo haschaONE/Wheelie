@@ -31,6 +31,8 @@ public enum Compressor {
             throw CompressionError.unsupported(source.lastPathComponent)
         }
 
+        // A cancelled job (window closed) must not deliver its file after all.
+        try Task.checkCancellation()
         let size = ByteSize.of(produced.url)
         guard size > 0, size < original, size <= (target ?? Int64.max) else {
             throw CompressionError.wouldExceed
@@ -51,12 +53,14 @@ enum BudgetSearch {
         precondition(levels > 0)
         var smallest = Int64.max
         for scale in scales {
+            try Task.checkCancellation()
             guard let worst = try await encode(levels - 1, scale) else { continue }
             smallest = min(smallest, Int64(worst.count))
             guard Int64(worst.count) <= cap else { continue }
             var lo = 0, hi = levels - 1
             var best = worst
             while lo < hi {
+                try Task.checkCancellation()
                 let mid = (lo + hi) / 2
                 guard let data = try await encode(mid, scale) else { break }
                 if Int64(data.count) <= cap { best = data; hi = mid } else { lo = mid + 1 }
