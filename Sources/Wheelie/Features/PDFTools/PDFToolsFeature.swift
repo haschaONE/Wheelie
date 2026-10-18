@@ -19,11 +19,11 @@ enum PDFToolsFeature: WheelieFeature {
                       perform: { files in
                           .outputs([try await runDetached { try PDFMerger.combine(files) }])
                       }),
-            // A single PDF with at least two pages.
+            // A single PDF. `accepts` must not open the file (it runs on the main thread on
+            // every drag, and reading a cloud-only or network file would block it); the
+            // window counts the pages in the background and explains a one-page PDF.
             WheelItem(id: "pdf.split", label: "Split", symbol: "rectangle.split.2x1", order: 52,
-                      accepts: { files in
-                          files.count == 1 && files.allAre(.pdf) && (PDFSourceLoader.pageCount(of: files[0]) ?? 0) >= 2
-                      },
+                      accepts: { files in files.count == 1 && files.allAre(.pdf) },
                       perform: { files in
                           PDFSplitWindow.open(files[0])
                           return .none
