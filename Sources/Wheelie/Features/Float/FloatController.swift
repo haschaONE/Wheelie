@@ -7,9 +7,10 @@ extension NSScreen {
         deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID
     }
 
-    /// Screen under a point, else the main screen.
-    static func floatScreen(containing point: NSPoint) -> NSScreen {
-        screens.first { NSMouseInRect(point, $0.frame, false) } ?? main ?? screens[0]
+    /// Screen under a point, else the main screen; nil while no display is attached
+    /// (the only monitor unplugged or switched off, a headless launch).
+    static func floatScreen(containing point: NSPoint) -> NSScreen? {
+        screens.first { NSMouseInRect(point, $0.frame, false) } ?? main ?? screens.first
     }
 
     /// Edges of this display a Float may dock to at height `y` (not shared with a neighbour).
@@ -17,8 +18,8 @@ extension NSScreen {
         FloatDocking.outerEdges(of: frame, others: NSScreen.screens.map(\.frame), at: y)
     }
 
-    /// Screen showing most of a rect, else the main screen.
-    static func floatScreen(for rect: NSRect) -> NSScreen {
+    /// Screen showing most of a rect, else the main screen; nil while no display is attached.
+    static func floatScreen(for rect: NSRect) -> NSScreen? {
         let best = screens.max { a, b in
             let ia = a.frame.intersection(rect), ib = b.frame.intersection(rect)
             return (ia.isNull ? 0 : ia.width * ia.height) < (ib.isNull ? 0 : ib.width * ib.height)
@@ -50,6 +51,8 @@ final class FloatController: NSObject, NSMenuDelegate {
     private var floatingFrame: NSRect = .zero
     private var dockCenterY: CGFloat = 0
     private var displayID: CGDirectDisplayID?
+    /// Visible frame of the screen the Float was last laid out on; used while no display is attached.
+    private var lastVisibleFrame: NSRect?
 
     // Moving
     private var grabOffset = NSPoint.zero
@@ -96,25 +99,38 @@ final class FloatController: NSObject, NSMenuDelegate {
 
     // MARK: Placement
 
-    private var screen: NSScreen {
+    private var screen: NSScreen? {
         if let displayID, let match = NSScreen.screens.first(where: { $0.floatDisplayID == displayID }) {
             return match
         }
         return NSScreen.floatScreen(for: panel.frame)
     }
 
+    /// Visible frame of the Float's screen, else the last one known (no display attached).
+    private var visibleFrame: NSRect? {
+        if let frame = screen?.visibleFrame { lastVisibleFrame = frame }
+        return lastVisibleFrame
+    }
+
     /// Floating, centred on `point`, avoiding other Floats' spots.
     func placeFloating(centeredOn point: NSPoint, avoiding others: [NSRect]) {
-        let visible = NSScreen.floatScreen(containing: point).visibleFrame
-        let frame = FloatDocking.frame(centeredOn: point, size: layout.panelSize, visibleFrame: visible)
-        floatingFrame = FloatDocking.cascade(frame, avoiding: others, visibleFrame: visible)
+        let size = layout.panelSize
         placement = .floating
         isExpanded = true
+        guard let visible = NSScreen.floatScreen(containing: point)?.visibleFrame else {
+            floatingFrame = NSRect(x: point.x - size.width / 2, y: point.y - size.height / 2,
+                                   width: size.width, height: size.height)
+            return
+        }
+        let frame = FloatDocking.frame(centeredOn: point, size: size, visibleFrame: visible)
+        floatingFrame = FloatDocking.cascade(frame, avoiding: others, visibleFrame: visible)
     }
 
     /// Floating with its top edge at `top` (under the menu bar), centred on `x`.
     func placeFloating(top: NSPoint, avoiding others: [NSRect]) {
-        let visible = NSScreen.floatScreen(containing: top).visibleFrame
+        guard let visible = NSScreen.floatScreen(containing: top)?.visibleFrame else {
+            return placeFloating(centeredOn: top, avoiding: others)
+        }
         let size = layout.panelSize
         let frame = FloatDocking.clamp(NSRect(x: top.x - size.width / 2, y: visible.maxY - 8 - size.height,
                                               width: size.width, height: size.height), to: visible)
@@ -129,9 +145,11 @@ final class FloatController: NSObject, NSMenuDelegate {
         case .floating:
             let frame = NSRect(x: floatingFrame.minX, y: floatingFrame.maxY - size.height,
                                width: size.width, height: size.height)
-            return isMoving ? frame : FloatDocking.clamp(frame, to: NSScreen.floatScreen(for: frame).visibleFrame)
+            guard !isMoving, let visible = NSScreen.floatScreen(for: frame)?.visibleFrame else { return frame }
+            return FloatDocking.clamp(frame, to: visible)
         case .docked(let edge):
-            let visible = screen.visibleFrame
+            // No display at all: stay put until one comes back (screenParametersChanged re-applies).
+            guard let visible = visibleFrame else { return panel.frame }
             return isExpanded
                 ? FloatDocking.attachedFrame(edge: edge, centerY: dockCenterY, size: size, visibleFrame: visible)
                 : FloatDocking.tabFrame(edge: edge, centerY: dockCenterY, visibleFrame: visible)
@@ -201,11 +219,11 @@ final class FloatController: NSObject, NSMenuDelegate {
         root.grid.reload(items: group.items, selection: group.selection, layout: layout,
                          viewport: layout.viewportSize)
         root.scrollView.hasVerticalScroller = layout.scrolls
-        let screen = self.screen
-        root.header.update(count: group.count, mode: viewMode,
-                           collapseEdge: dockedEdge ?? FloatDocking.collapseEdge(
-                               for: panel.frame, visibleFrame: screen.visibleFrame,
-                               allowed: screen.floatOuterEdges(at: panel.frame.midY)))
+        let collapseEdge = dockedEdge ?? screen.map {
+            FloatDocking.collapseEdge(for: panel.frame, visibleFrame: $0.visibleFrame,
+                                      allowed: $0.floatOuterEdges(at: panel.frame.midY))
+        } ?? .right
+        root.header.update(count: group.count, mode: viewMode, collapseEdge: collapseEdge)
         root.tab.update(items: group.items)
     }
 
@@ -263,13 +281,15 @@ final class FloatController: NSObject, NSMenuDelegate {
     }
 
     func screenParametersChanged() {
-        guard !isClosing else { return }
+        // With no display attached there is nowhere to go: keep the current frame (and the
+        // docked display) and wait for the next change, when a screen is back.
+        guard !isClosing, let fallback = NSScreen.main ?? NSScreen.screens.first else { return }
         if dockedEdge != nil {
             if let displayID, !NSScreen.screens.contains(where: { $0.floatDisplayID == displayID }) {
-                self.displayID = (NSScreen.main ?? NSScreen.screens.first)?.floatDisplayID
+                self.displayID = fallback.floatDisplayID
             }
         } else if !NSScreen.screens.contains(where: { $0.visibleFrame.intersects(floatingFrame) }) {
-            let visible = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
+            let visible = fallback.visibleFrame
             floatingFrame = FloatDocking.frame(centeredOn: NSPoint(x: visible.midX, y: visible.midY),
                                                size: layout.panelSize, visibleFrame: visible)
         }
@@ -295,7 +315,11 @@ final class FloatController: NSObject, NSMenuDelegate {
             let size = panel.frame.size
             let proposed = NSRect(x: point.x - grabOffset.x, y: point.y - grabOffset.y,
                                   width: size.width, height: size.height)
-            let pointerScreen = NSScreen.floatScreen(containing: point)
+            guard let pointerScreen = NSScreen.floatScreen(containing: point) else {
+                panel.setFrameOrigin(proposed.origin)
+                floatingFrame = proposed
+                return
+            }
             if let edge = FloatDocking.decision(cursor: point, frame: proposed,
                                                 visibleFrame: pointerScreen.visibleFrame, current: nil,
                                                 allowed: pointerScreen.floatOuterEdges(at: point.y)) {
@@ -313,7 +337,7 @@ final class FloatController: NSObject, NSMenuDelegate {
                 floatingFrame = proposed
             }
         case .docked(let edge):
-            let visible = screen.visibleFrame
+            guard let visible = visibleFrame else { return }
             if FloatDocking.decision(cursor: point, frame: panel.frame, visibleFrame: visible, current: edge) == nil {
                 placement = .floating
                 isExpanded = true
@@ -354,7 +378,7 @@ final class FloatController: NSObject, NSMenuDelegate {
     func collapse() {
         switch placement {
         case .floating:
-            let screen = NSScreen.floatScreen(for: panel.frame)
+            guard let screen = NSScreen.floatScreen(for: panel.frame) else { return }
             displayID = screen.floatDisplayID
             dockCenterY = panel.frame.midY
             placement = .docked(FloatDocking.collapseEdge(for: panel.frame, visibleFrame: screen.visibleFrame,
@@ -500,17 +524,42 @@ final class FloatController: NSObject, NSMenuDelegate {
         FloatManager.shared.setNeedsSave()
     }
 
-    /// Follows renamed/moved files and drops deleted or trashed ones.
+    /// Follows renamed/moved files, drops deleted or trashed ones, and marks the ones on
+    /// unmounted volumes. The file system is checked off the main thread: a stat on a dropped
+    /// network share can block for tens of seconds.
     func refreshFiles() {
         guard !isClosing, !group.isEmpty else { return }
+        guard !isRefreshing else {
+            needsRefresh = true   // asked again meanwhile; look once more when this check is done
+            return
+        }
+        isRefreshing = true
+        needsRefresh = false
+        let items = group.items
+        Task.detached(priority: .utility) { [weak self] in
+            var results: [UUID: FloatGroup.Check] = [:]
+            for item in items { results[item.id] = FloatStore.check(item) }
+            await self?.applyRefresh(results)
+        }
+    }
+
+    private var isRefreshing = false
+    private var needsRefresh = false
+
+    private func applyRefresh(_ results: [UUID: FloatGroup.Check]) {
+        isRefreshing = false
+        guard !isClosing else { return }
         var updated = group
-        guard updated.refresh({ FloatStore.check($0) }) else { return }
-        group = updated
-        if group.isEmpty {
-            close()
-        } else {
+        // Items added while the check ran weren't checked; they were just dropped in, so present.
+        if updated.refresh({ results[$0.id] ?? .present }) {
+            group = updated
+            if group.isEmpty {
+                close()
+                return
+            }
             contentChanged()
         }
+        if needsRefresh { refreshFiles() }
     }
 
     func dragOutBegan() {
@@ -590,20 +639,28 @@ final class FloatController: NSObject, NSMenuDelegate {
         pasteboard.writeObjects(urls.map { $0 as NSURL })
     }
 
+    /// Finder-style duplicate next to each selected file. Copies run off the main thread
+    /// (a big file on a non-APFS or network volume takes a while); a failed copy is cleaned up.
     func duplicateSelection() {
-        var copies: [URL] = []
-        var failure: Error?
-        for url in targetURLs {
-            let destination = FloatStore.duplicateURL(for: url)
-            do {
-                try FileManager.default.copyItem(at: url, to: destination)
-                copies.append(destination)
-            } catch {
-                failure = failure ?? error
-            }
+        let sources = targetURLs
+        guard !sources.isEmpty else { return }
+        Task { [weak self] in
+            let (copies, failure) = await Task.detached(priority: .userInitiated) { () -> ([URL], String?) in
+                var copies: [URL] = []
+                var failure: String?
+                for url in sources {
+                    do {
+                        copies.append(try FloatStore.duplicate(url))
+                    } catch {
+                        failure = failure ?? error.localizedDescription
+                    }
+                }
+                return (copies, failure)
+            }.value
+            guard let self else { return }
+            if !copies.isEmpty, !self.isClosing { self.add(copies, select: true) }
+            if let failure { self.present(message: failure, title: "Couldn't duplicate") }
         }
-        if !copies.isEmpty { add(copies, select: true) }
-        if let failure { present(failure, title: "Couldn't duplicate") }
     }
 
     func trashSelection() {
@@ -722,22 +779,19 @@ final class FloatController: NSObject, NSMenuDelegate {
     }
 
     private func navigate(_ direction: FloatMove, extend: Bool) {
-        let current = group.anchor.flatMap(group.index(of:)) ?? group.selectedItems.last.flatMap { group.index(of: $0.id) }
-        let focus: Int? = extend ? lastFocus ?? current : current
-        guard let next = layout.index(from: focus, moving: direction) else { return }
+        // ⇧ continues from the moving end of the current ⇧-range; the group resets that
+        // end on any other selection change (clicks, type-select, ⌘A, removal...).
+        let origin = group.navigationOrigin(extending: extend)
+        guard let next = layout.index(from: origin, moving: direction) else { return }
         let id = group.items[next].id
         if extend {
             group.click(id, modifiers: .extend)
-            lastFocus = next
         } else {
             group.select(only: id)
-            lastFocus = nil
         }
         selectionChanged()
         root.grid.scrollToItem(id)
     }
-
-    private var lastFocus: Int?
 
     private func typeSelect(_ text: String) {
         let now = Date()
@@ -944,23 +998,27 @@ final class FloatController: NSObject, NSMenuDelegate {
         let edge = dockedEdge
         return FloatSnapshot(id: id, frame: edge == nil ? panel.frame : floatingFrame, edge: edge,
                              dockCenterY: edge == nil ? nil : dockCenterY,
-                             displayID: displayID ?? screen.floatDisplayID, viewMode: viewMode,
+                             displayID: displayID ?? screen?.floatDisplayID, viewMode: viewMode,
                              items: group.items.map(FloatStore.record(for:)))
     }
 
-    /// Rebuilds a saved Float; nil when none of its files exist any more.
+    /// Rebuilds a saved Float without touching the file system (that could block launch on
+    /// a dead network share); the caller runs `refreshFiles()`, which follows moved files,
+    /// drops deleted ones and keeps the ones on volumes that aren't mounted yet.
+    /// Nil when the snapshot holds no files.
     static func restore(_ snapshot: FloatSnapshot) -> FloatController? {
-        let items = snapshot.items.compactMap(FloatStore.item(from:))
+        let items = snapshot.items.map(FloatStore.unverifiedItem(from:))
         guard !items.isEmpty else { return nil }
         let controller = FloatController(id: snapshot.id, items: items, viewMode: snapshot.viewMode)
         controller.floatingFrame = snapshot.frame
-        let known = NSScreen.screens.first { $0.floatDisplayID == snapshot.displayID }
         if let edge = snapshot.edge {
-            let screen = known ?? NSScreen.main ?? NSScreen.screens[0]
-            controller.displayID = screen.floatDisplayID
+            let screen = NSScreen.screens.first { $0.floatDisplayID == snapshot.displayID }
+                ?? NSScreen.main ?? NSScreen.screens.first
+            // No display yet (headless launch): keep the saved one until a screen appears.
+            controller.displayID = screen?.floatDisplayID ?? snapshot.displayID
             controller.placement = .docked(edge)
             controller.isExpanded = false
-            controller.dockCenterY = snapshot.dockCenterY ?? screen.visibleFrame.midY
+            controller.dockCenterY = snapshot.dockCenterY ?? screen?.visibleFrame.midY ?? snapshot.frame.midY
         }
         controller.screenParametersChanged()
         return controller

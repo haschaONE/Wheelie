@@ -634,6 +634,8 @@ final class FloatTileView: NSView {
             setAccessibilityLabel(label.stringValue)
             setAccessibilityHelp("Double-click to open; drag to carry the file.")
         }
+        // On an unmounted or unreachable volume: kept, but dimmed until it's back.
+        alphaValue = item.isUnavailable ? 0.4 : 1
         if urlChanged || modeChanged {
             label.font = .systemFont(ofSize: mode == .icons ? 11 : 12)
             label.alignment = mode == .icons ? .center : .left

@@ -13,10 +13,12 @@ public enum FloatDocking {
     public static let tabSize = CGSize(width: 62, height: 104)
     /// The pointer within this distance of an edge attaches a moving Float.
     public static let attachZone: CGFloat = 24
-    /// A floating Float pushed this fraction of its width past an edge attaches too.
+    /// A floating Float pushed this fraction of its width past an edge attaches too,
+    /// as long as the pointer is within `detachDistance` of that edge.
     public static let overshootFraction: CGFloat = 0.4
-    /// A docked Float detaches once the pointer is this far from its edge.
+    /// A docked tab detaches once the pointer is this far from its edge.
     /// Larger than the tab plus the attach zone, so attach/detach has hysteresis.
+    /// An expanded docked panel reaches further in; see `detachThreshold`.
     public static let detachDistance: CGFloat = 110
     /// Keeps tabs and docked panels off the very top/bottom of the screen.
     public static let verticalInset: CGFloat = 8
@@ -29,20 +31,34 @@ public enum FloatDocking {
     ///   - allowed: edges that may take a tab (see `outerEdges`).
     public static func decision(cursor: CGPoint, frame: CGRect, visibleFrame: CGRect, current: FloatEdge?,
                                 allowed: Set<FloatEdge> = [.left, .right]) -> FloatEdge? {
+        let fromLeft = cursor.x - visibleFrame.minX
+        let fromRight = visibleFrame.maxX - cursor.x
         if let current {
-            let distance = current == .left ? cursor.x - visibleFrame.minX : visibleFrame.maxX - cursor.x
-            return distance > detachDistance ? nil : current
+            let distance = current == .left ? fromLeft : fromRight
+            return distance > detachThreshold(frame: frame, edge: current, visibleFrame: visibleFrame) ? nil : current
         }
+        // Overshoot only counts while the pointer is close enough to stay attached
+        // afterwards; otherwise the Float would dock and immediately detach again.
         let overshoot = frame.width * overshootFraction
         if allowed.contains(.left),
-           cursor.x <= visibleFrame.minX + attachZone || frame.minX <= visibleFrame.minX - overshoot {
+           fromLeft <= attachZone || (frame.minX <= visibleFrame.minX - overshoot && fromLeft <= detachDistance) {
             return .left
         }
         if allowed.contains(.right),
-           cursor.x >= visibleFrame.maxX - attachZone || frame.maxX >= visibleFrame.maxX + overshoot {
+           fromRight <= attachZone || (frame.maxX >= visibleFrame.maxX + overshoot && fromRight <= detachDistance) {
             return .right
         }
         return nil
+    }
+
+    /// How far from `edge` the pointer may go before a Float docked there with `frame`
+    /// detaches. A collapsed tab uses `detachDistance`; a wider expanded panel adds the
+    /// same margin beyond its inner side, so it can be held anywhere and slid along the edge.
+    public static func detachThreshold(frame: CGRect, edge: FloatEdge, visibleFrame: CGRect) -> CGFloat {
+        // How far the docked frame reaches in from the edge (it is flush with it; never more than its width).
+        let fromEdge = edge == .left ? frame.maxX - visibleFrame.minX : visibleFrame.maxX - frame.minX
+        let reach = max(0, min(frame.width, fromEdge))
+        return max(detachDistance, reach + (detachDistance - tabSize.width))
     }
 
     /// Edges of a display that don't border another display at height `y`, so moving
