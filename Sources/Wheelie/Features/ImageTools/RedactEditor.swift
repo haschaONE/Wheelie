@@ -2,6 +2,16 @@ import AppKit
 import SwiftUI
 import WheelieCore
 
+/// Preview pixels for one blur/pixelate rectangle, in preview-image pixels.
+struct RedactPatch: @unchecked Sendable {
+    /// The rectangle it was rendered for (scaled to the preview), to tell when it's out of date.
+    var sourceRect: CGRect
+    /// Whole-pixel area the image covers.
+    var pixelRect: CGRect
+    var style: RedactionStyle
+    var image: CGImage
+}
+
 @MainActor
 final class RedactModel: ObservableObject {
     let url: URL
@@ -14,17 +24,20 @@ final class RedactModel: ObservableObject {
     @Published var loadError: String?
     @Published var error: String?
     @Published var busy = false
-    @Published var rects: [RedactionRect] = []
+    @Published var rects: [RedactionRect] = [] { didSet { refreshPatches() } }
     @Published var selection: UUID?
-    @Published var style: RedactionStyle = .blackBox { didSet { prepareEffect() } }
-    @Published private(set) var effects: [RedactionStyle: CGImage] = [:]
+    @Published var style: RedactionStyle = .blackBox { didSet { if style != oldValue { refreshPatches() } } }
+    /// Blur/pixelate previews per rectangle, rendered on the preview photo the same way the export
+    /// renders them (see `Redactor.previewPatch`).
+    @Published private(set) var patches: [UUID: RedactPatch] = [:]
     @Published private(set) var detecting: RedactionDetector.Kind?
     @Published var detectionMessage: String?
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
 
-    private var undoStack: [[RedactionRect]] = []
-    private var redoStack: [[RedactionRect]] = []
+    private var history = EditHistory<[RedactionRect]>()
+    private var patchTask: Task<Void, Never>?
+    private var patchesStale = false
 
     private enum Drag {
         case move(UUID, CGRect, CGPoint, moved: Bool)
@@ -46,7 +59,7 @@ final class RedactModel: ObservableObject {
             self.preview = preview
             formatLabel = await ImageEditorUI.formatLabel(for: source, preview: preview)
             if isMultiFrame { error = "Redact one still photo at a time. Export the frames or pages first." }
-            prepareEffect()
+            refreshPatches()
         } catch {
             loadError = error.localizedDescription
         }
@@ -63,42 +76,81 @@ final class RedactModel: ObservableObject {
 
     var selectedRect: RedactionRect? { index(of: selection).map { rects[$0] } }
 
-    /// Whole-photo blur/pixelation at preview size, shown through each rectangle.
-    private func prepareEffect() {
-        guard let preview, style != .blackBox, effects[style] == nil else { return }
-        let current = style
-        Task {
-            let image = await Task.detached(priority: .userInitiated) { Redactor.effectImage(preview, style: current) }.value
-            if let image { effects[current] = image }
+    // MARK: Preview patches
+
+    /// Re-renders the blur/pixelate preview of rectangles that moved, changed size or style. Runs
+    /// one batch at a time off the main thread; changes made meanwhile are picked up afterwards.
+    private func refreshPatches() {
+        guard preview != nil else { return }
+        if style == .blackBox {
+            patches = [:]
+            return
         }
+        if patchTask != nil {
+            patchesStale = true
+            return
+        }
+        patchTask = Task { [weak self] in
+            await self?.updatePatches()
+            self?.patchTask = nil
+        }
+    }
+
+    private func updatePatches() async {
+        repeat {
+            patchesStale = false
+            guard let preview, style != .blackBox else { return }
+            let current = style
+            let scale = CGFloat(preview.width) / max(imageSize.width, 1)
+            let wanted = rects.map { (id: $0.id, rect: $0.rect.scaled(by: scale)) }
+            let missing = wanted.filter { item in
+                guard let p = patches[item.id] else { return true }
+                return p.style != current || p.sourceRect != item.rect
+            }
+            var made: [UUID: RedactPatch] = [:]
+            if !missing.isEmpty {
+                made = await Task.detached(priority: .userInitiated) {
+                    var out: [UUID: RedactPatch] = [:]
+                    for item in missing {
+                        if let p = Redactor.previewPatch(preview, rect: item.rect, style: current) {
+                            out[item.id] = RedactPatch(sourceRect: item.rect, pixelRect: p.rect, style: current, image: p.image)
+                        }
+                    }
+                    return out
+                }.value
+            }
+            let ids = Set(wanted.map(\.id))
+            var next = patches.filter { ids.contains($0.key) }
+            next.merge(made) { _, new in new }
+            patches = next
+        } while patchesStale
     }
 
     // MARK: Undo
 
-    private func checkpoint() {
-        undoStack.append(rects)
-        if undoStack.count > 200 { undoStack.removeFirst() }
-        redoStack.removeAll()
-        canUndo = true
-        canRedo = false
+    /// `group` coalesces repeated edits (arrow-key nudges of one rectangle) into a single undo step.
+    private func checkpoint(_ group: String? = nil) {
+        history.checkpoint(rects, group: group)
+        updateUndoFlags()
+    }
+
+    private func updateUndoFlags() {
+        canUndo = history.canUndo
+        canRedo = history.canRedo
     }
 
     func undo() {
-        guard let previous = undoStack.popLast() else { return }
-        redoStack.append(rects)
+        guard let previous = history.undo(from: rects) else { return }
         rects = previous
         if index(of: selection) == nil { selection = nil }
-        canUndo = !undoStack.isEmpty
-        canRedo = true
+        updateUndoFlags()
     }
 
     func redo() {
-        guard let next = redoStack.popLast() else { return }
-        undoStack.append(rects)
+        guard let next = history.redo(from: rects) else { return }
         rects = next
         if index(of: selection) == nil { selection = nil }
-        canUndo = true
-        canRedo = !redoStack.isEmpty
+        updateUndoFlags()
     }
 
     func deleteSelection() {
@@ -182,7 +234,10 @@ final class RedactModel: ObservableObject {
         case 126: delta = CGSize(width: 0, height: -step)
         default: return false
         }
-        rects[i].rect = CropGeometry.move(rects[i].rect, by: delta, in: bounds)
+        let moved = CropGeometry.move(rects[i].rect, by: delta, in: bounds)
+        guard moved != rects[i].rect else { return true }
+        checkpoint("nudge-\(rects[i].id)")
+        rects[i].rect = moved
         return true
     }
 
@@ -389,13 +444,22 @@ private struct RedactCanvas: View {
                 .frame(width: displaySize.width, height: displaySize.height)
             if model.style == .blackBox {
                 shapes.fill(Color.black)
-            } else if let effect = model.effects[model.style] {
-                Image(decorative: effect, scale: 1)
-                    .resizable()
-                    .frame(width: displaySize.width, height: displaySize.height)
-                    .mask(shapes.fill(Color.black))
             } else {
+                // Gray until a rectangle's preview is ready.
                 shapes.fill(Color.gray.opacity(0.8))
+                ForEach(model.rects) { item in
+                    if let patch = model.patches[item.id], patch.style == model.style {
+                        // While a moved rectangle re-renders, its last patch fills the new spot.
+                        let current = patch.sourceRect == item.rect.scaled(by: CGFloat(preview.width) / max(model.imageSize.width, 1))
+                        let frame = current ? patch.pixelRect.scaled(by: displaySize.width / CGFloat(max(preview.width, 1)))
+                                            : item.rect.scaled(by: s)
+                        Image(decorative: patch.image, scale: 1)
+                            .resizable()
+                            .interpolation(s > 1.5 ? .none : .high)
+                            .frame(width: frame.width, height: frame.height)
+                            .position(x: frame.midX, y: frame.midY)
+                    }
+                }
             }
             shapes.stroke(Color.white.opacity(0.8), style: StrokeStyle(lineWidth: 1 / mag, dash: [4 / mag, 3 / mag]))
             if let selected = model.selectedRect {

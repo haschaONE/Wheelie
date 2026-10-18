@@ -189,18 +189,66 @@ public enum ImageToolsIO {
     }
 
     /// Keeps the source format when it's writable and can hold the result; otherwise PNG.
+    ///
+    /// The type comes from the file's content (`sourceType`, as sniffed by ImageIO), and the extension
+    /// always matches it: the source's own extension is kept only when it names that format, so WebP
+    /// data saved as "pic.jpg" comes out as "….webp", never as a ".jpg" holding WebP.
+    ///
+    /// `pixelSize` is the size of the image being written. ICO and ICNS can only hold a few square
+    /// icon sizes, so they're kept only when the result is one of those (PNG otherwise, or when the
+    /// size isn't given).
     public static func plan(sourceType: String, sourceExtension: String, transparent: Bool,
+                            pixelSize: CGSize? = nil,
                             cwebpAvailable: Bool = Tools.locate("cwebp") != nil) -> ExportPlan {
         let png = ExportPlan(type: .png, fileExtension: "png", useCWebP: false)
         let type = UTType(sourceType) ?? UTType(filenameExtension: sourceExtension) ?? .png
         if transparent && !alphaCapable.contains(type.identifier) { return png }
-        let ext = sourceExtension.isEmpty ? (type.preferredFilenameExtension ?? "png") : sourceExtension
-        if type.conforms(to: .webP) || ext.lowercased() == "webp" {
+        let ext = outputExtension(sourceExtension: sourceExtension, type: type)
+        if type.conforms(to: .webP) {
             return cwebpAvailable ? ExportPlan(type: .webP, fileExtension: ext, useCWebP: true) : png
         }
         let writable = (CGImageDestinationCopyTypeIdentifiers() as? [String]) ?? []
         guard writable.contains(type.identifier), type != .pdf else { return png }
+        if iconSides[type.identifier] != nil && !canEncodeIcon(type, pixelSize: pixelSize) { return png }
         return ExportPlan(type: type, fileExtension: ext, useCWebP: false)
+    }
+
+    /// HEIF containers: a ".heif" file holding HEIC data (or the other way round) keeps its name.
+    private static let heifFamily: Set<String> = [UTType.heic.identifier, "public.heif"]
+
+    /// The source's own extension when it names `type` (keeps "jpg" vs "jpeg", "tif", case…),
+    /// otherwise the type's usual one.
+    static func outputExtension(sourceExtension: String, type: UTType) -> String {
+        if !sourceExtension.isEmpty, let named = UTType(filenameExtension: sourceExtension),
+           named.conforms(to: type) || type.conforms(to: named)
+            || (heifFamily.contains(named.identifier) && heifFamily.contains(type.identifier)) {
+            return sourceExtension
+        }
+        if type.conforms(to: .jpeg) { return "jpg" }
+        return type.preferredFilenameExtension ?? "png"
+    }
+
+    /// Square sizes (pixels) ImageIO's icon encoders accept; any other size fails at finalize.
+    static let iconSides: [String: Set<Int>] = [
+        UTType.ico.identifier: [16, 24, 32, 48, 64, 128, 256],
+        UTType.icns.identifier: [16, 24, 32, 48, 64, 128, 256, 512, 1024],
+    ]
+
+    /// Whether ImageIO can write an icon of `pixelSize` as `type`.
+    static func canEncodeIcon(_ type: UTType, pixelSize: CGSize?) -> Bool {
+        guard let sides = iconSides[type.identifier], let pixelSize else { return false }
+        let w = Int(pixelSize.width.rounded()), h = Int(pixelSize.height.rounded())
+        return w == h && sides.contains(w)
+    }
+
+    /// ImageIO picks the ICNS slot from size and DPI: 64 and 1024 px exist only as Retina (144 DPI)
+    /// variants, 16, 24 and 128 px only at 72 DPI. Other sizes keep a carried 144 DPI.
+    static func icnsDPI(side: Int, carried: Any?) -> Double {
+        switch side {
+        case 64, 1024: return 144
+        case 16, 24, 128: return 72
+        default: return (carried as? NSNumber)?.doubleValue == 144 ? 144 : 72
+        }
     }
 
     /// Metadata to carry over: EXIF/TIFF/GPS/IPTC/DPI, with orientation reset (pixels are upright now)
@@ -235,6 +283,11 @@ public enum ImageToolsIO {
         }
         var props = metadata
         props[kCGImageDestinationLossyCompressionQuality] = 0.92
+        if type == .icns {
+            let dpi = icnsDPI(side: image.width, carried: props[kCGImagePropertyDPIWidth])
+            props[kCGImagePropertyDPIWidth] = dpi
+            props[kCGImagePropertyDPIHeight] = dpi
+        }
         CGImageDestinationAddImage(dest, image, props as CFDictionary)
         guard CGImageDestinationFinalize(dest) else {
             try? FileManager.default.removeItem(at: url)
@@ -266,7 +319,8 @@ public enum ImageToolsIO {
             plan = ExportPlan(type: forceType, fileExtension: forceType.preferredFilenameExtension ?? "png", useCWebP: false)
         } else {
             plan = Self.plan(sourceType: source.typeIdentifier, sourceExtension: source.url.pathExtension,
-                             transparent: hasTransparency(image))
+                             transparent: hasTransparency(image),
+                             pixelSize: CGSize(width: image.width, height: image.height))
         }
         let output = OutputNaming.uniqueURL(for: source.url, ext: plan.fileExtension, suffix: suffix)
         let metadata = preserveMetadata ? carriedMetadata(from: source.properties) : [kCGImagePropertyOrientation: 1]
@@ -283,7 +337,15 @@ public enum ImageToolsIO {
                 throw error
             }
         } else {
-            try write(image, to: output, type: plan.type, metadata: metadata)
+            do {
+                try write(image, to: output, type: plan.type, metadata: metadata)
+            } catch ImageToolError.writeFailed where forceType == nil && plan.type != .png {
+                // Some writable formats only take certain sizes or layouts; save the edit as PNG
+                // rather than failing the whole export.
+                let fallback = OutputNaming.uniqueURL(for: source.url, ext: "png", suffix: suffix)
+                try write(image, to: fallback, type: .png, metadata: metadata)
+                return fallback
+            }
         }
         return output
     }

@@ -335,34 +335,36 @@ public enum AnnotationRenderer {
                                      colorSpace: ImageToolsIO.workingColorSpace(for: image))
     }
 
-    /// Transparent overlay of the annotations at `outputSize` (for live previews).
-    public static func overlay(_ annotations: [Annotation], imageSize: CGSize, outputSize: CGSize, scale: CGFloat,
-                               blurSource: CGImage?) -> CGImage? {
-        let w = max(1, Int(outputSize.width.rounded())), h = max(1, Int(outputSize.height.rounded()))
-        guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-        ImageToolsIO.flipToTopLeft(ctx, height: h)
-        ctx.scaleBy(x: CGFloat(w) / imageSize.width, y: CGFloat(h) / imageSize.height)
-        ctx.clip(to: CGRect(origin: .zero, size: imageSize))
-        draw(annotations, in: ctx, imageSize: imageSize, scale: scale, blurSource: blurSource)
-        return ctx.makeImage()
+    /// The annotations drawn onto `photo`, a (usually downscaled) copy of the image, for live previews.
+    /// Annotation coordinates are in `imageSize` pixels. Composited exactly like `render`, so blend modes
+    /// (the highlighter multiplies onto the photo) look the same as in the saved file.
+    public static func preview(_ annotations: [Annotation], on photo: CGImage, imageSize: CGSize, scale: CGFloat,
+                               blurSource: CGImage?) throws -> CGImage {
+        try composite(annotations, onto: photo, imageSize: imageSize, scale: scale, blurSource: blurSource)
     }
 
     /// Burns the annotations into the photo at full resolution.
     public static func render(_ image: CGImage, _ document: AnnotationDocument,
                               context: CIContext = ImageAdjust.sharedContext) throws -> CGImage {
         let size = CGSize(width: image.width, height: image.height)
-        let ctx = try ImageToolsIO.makeContext(width: image.width, height: image.height, like: image,
-                                               alpha: ImageCrop.hasAlpha(image))
-        let full = CGRect(origin: .zero, size: size)
-        ctx.setBlendMode(.copy)
-        ctx.draw(image, in: full)
-        ctx.setBlendMode(.normal)
-        ImageToolsIO.flipToTopLeft(ctx, height: image.height)
-        ctx.clip(to: full)
         let blur = document.annotations.contains { $0.kind == .blur } ? blurredCopy(of: image, context: context) : nil
-        draw(document.annotations, in: ctx, imageSize: size, scale: document.scale(for: size), blurSource: blur)
+        return try composite(document.annotations, onto: image, imageSize: size, scale: document.scale(for: size),
+                             blurSource: blur)
+    }
+
+    /// Copies `photo` into a new canvas of its size, then draws the annotations (given in `imageSize`
+    /// pixel space) on top of the photo's own pixels.
+    private static func composite(_ annotations: [Annotation], onto photo: CGImage, imageSize: CGSize, scale: CGFloat,
+                                  blurSource: CGImage?) throws -> CGImage {
+        let ctx = try ImageToolsIO.makeContext(width: photo.width, height: photo.height, like: photo,
+                                               alpha: ImageCrop.hasAlpha(photo))
+        ctx.setBlendMode(.copy)
+        ctx.draw(photo, in: CGRect(x: 0, y: 0, width: photo.width, height: photo.height))
+        ctx.setBlendMode(.normal)
+        ImageToolsIO.flipToTopLeft(ctx, height: photo.height)
+        ctx.scaleBy(x: CGFloat(photo.width) / max(imageSize.width, 1), y: CGFloat(photo.height) / max(imageSize.height, 1))
+        ctx.clip(to: CGRect(origin: .zero, size: imageSize))
+        draw(annotations, in: ctx, imageSize: imageSize, scale: scale, blurSource: blurSource)
         guard let result = ctx.makeImage() else { throw ImageToolError.renderFailed("annotated image") }
         return result
     }

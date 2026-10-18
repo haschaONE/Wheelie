@@ -78,7 +78,8 @@ final class AnnotateModel: ObservableObject {
 
     @Published private(set) var source: SourceImage?
     @Published private(set) var preview: CGImage?
-    @Published private(set) var overlay: CGImage?
+    /// The preview photo with the annotations drawn in (nil while there are none).
+    @Published private(set) var annotated: CGImage?
     @Published private(set) var formatLabel = ""
     @Published var loadError: String?
     @Published var error: String?
@@ -157,13 +158,14 @@ final class AnnotateModel: ObservableObject {
     func bounds(of a: Annotation) -> CGRect { AnnotationGeometry.bounds(a, scale: scale) }
     func textBox(of a: Annotation) -> CGRect { AnnotationGeometry.textRect(a, scale: scale) }
 
+    /// Draws the annotations onto the preview photo itself (not onto a transparent layer), so the
+    /// highlighter's multiply blend looks as it will in the saved file.
     private func renderOverlay() {
-        guard let preview, source != nil else { overlay = nil; return }
+        guard let preview, source != nil else { annotated = nil; return }
         var marks = document.annotations
         if let draft { marks.append(draft) }
-        overlay = marks.isEmpty ? nil : AnnotationRenderer.overlay(marks, imageSize: imageSize,
-                                                                    outputSize: CGSize(width: preview.width, height: preview.height),
-                                                                    scale: scale, blurSource: blurPreview)
+        annotated = marks.isEmpty ? nil : try? AnnotationRenderer.preview(marks, on: preview, imageSize: imageSize,
+                                                                           scale: scale, blurSource: blurPreview)
     }
 
     private func selectionChanged(from old: UUID?) {
@@ -629,16 +631,10 @@ private struct AnnotateCanvas: View {
         let mag = max(zoom.magnification, 0.1)
         let tolerance = (6 / mag) / s
         ZStack(alignment: .topLeading) {
-            Image(decorative: preview, scale: 1)
+            Image(decorative: model.annotated ?? preview, scale: 1)
                 .resizable()
                 .interpolation(s > 1.5 ? .none : .high)
                 .frame(width: displaySize.width, height: displaySize.height)
-            if let overlay = model.overlay {
-                Image(decorative: overlay, scale: 1)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: displaySize.width, height: displaySize.height)
-            }
             if let selected = model.selectedAnnotation {
                 selection(for: selected, s: s, mag: mag)
             }

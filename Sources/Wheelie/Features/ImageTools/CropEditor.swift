@@ -28,7 +28,10 @@ final class CropModel: ObservableObject {
         }
     }
     @Published var lockResizeRatio = true
-    @Published private(set) var formatLabel = ""
+    /// Format inputs that don't change while cropping (the label itself follows the output size,
+    /// since icon formats only hold a few sizes).
+    @Published private var previewTransparent = false
+    private var cwebpAvailable = false
 
     /// Upright, unrotated preview; `displayImage` is it with the current turns/flips.
     private var preview: CGImage?
@@ -51,7 +54,8 @@ final class CropModel: ObservableObject {
             let (source, preview) = try await ImageEditorUI.load(url, previewSize: 2400)
             self.source = source
             self.preview = preview
-            formatLabel = await ImageEditorUI.formatLabel(for: source, preview: preview)
+            cwebpAvailable = Tools.locate("cwebp") != nil
+            previewTransparent = await ImageEditorUI.isTransparent(preview)
             refreshDisplay()
         } catch {
             loadError = error.localizedDescription
@@ -73,6 +77,13 @@ final class CropModel: ObservableObject {
     var ratio: CGFloat? { aspect.ratio(for: orientedSize) }
     var pixelCrop: CGRect { settings.effectiveCrop(for: sourceSize) }
     var outputSize: CGSize { settings.outputSize(for: sourceSize) }
+
+    /// "JPG", "PNG"… — what the crop at its current output size will be saved as.
+    var formatLabel: String {
+        guard let source else { return "" }
+        return ImageEditorUI.formatLabel(for: source, transparent: previewTransparent, size: outputSize,
+                                         cwebpAvailable: cwebpAvailable)
+    }
 
     private func setCrop(_ rect: CGRect) {
         settings.cropRect = rect
