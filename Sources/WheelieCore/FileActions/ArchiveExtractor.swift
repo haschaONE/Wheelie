@@ -346,7 +346,7 @@ public enum ArchiveExtractor {
     }
 
     /// Throws if any symlink inside `root` points (or resolves) outside it. Fails closed: dangling
-    /// links are followed as far as they exist and the rest of the path is applied lexically, link
+    /// links are followed as far as they exist and may only continue with plain names (no `..`), link
     /// loops are refused, and folders the owner can't list are opened for the check (their modes are
     /// restored afterwards) so no link can hide in one.
     static func verifyContained(_ root: URL, fileManager fm: FileManager = .default) throws {
@@ -373,8 +373,10 @@ public enum ArchiveExtractor {
     /// Follows `relative` (inside the real path `root`) one component at a time, expanding every
     /// symlink before a later `..` is applied, as the kernel does. False if any step leaves `root`
     /// (even to come back in by name: that breaks once the folder is moved or renamed), on an
-    /// absolute link, or on a link loop. A component that doesn't exist yet ends the physical walk;
-    /// the rest of the path is applied lexically, since it can only be created as plain names.
+    /// absolute link, or on a link loop. A component that doesn't exist yet ends the physical walk:
+    /// only plain names may follow it. A `..` after it is refused (fail closed), because a lexical
+    /// pop there can't be checked: later names aren't followed through links (`y -> .`), and the
+    /// missing name may exist by the time the link is used, so `nope/../y/..` could leave `root`.
     static func resolvesInside(_ relative: String, root: String) -> Bool {
         var resolved: [String] = []
         var pending = Array(relative.split(separator: "/").map(String.init).reversed())
@@ -383,7 +385,7 @@ public enum ArchiveExtractor {
         while let part = pending.popLast() {
             if part.isEmpty || part == "." { continue }
             if part == ".." {
-                if resolved.isEmpty { return false }
+                if missing || resolved.isEmpty { return false }
                 resolved.removeLast()
                 continue
             }

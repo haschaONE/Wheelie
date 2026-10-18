@@ -545,6 +545,59 @@ final class FileActionsTests: XCTestCase {
         }
     }
 
+    /// Once a component is missing, the walk can't follow later names through links, so a `..`
+    /// after it must be refused: with `y -> .`, `nope/../y/..` passes a lexical count (depth 1, 0,
+    /// 1, 0) yet leaves the folder as soon as `nope` exists. Plain names after a gap stay allowed.
+    func testDotDotAfterMissingComponentIsRefused() throws {
+        let fm = FileManager.default
+        let dir = try fileActionsTempDir()
+        let root = try mkdir(dir, "bundle")
+        try mkdir(root, "sub")
+        for (name, target) in [("y", "."), ("climb", "nope/../../outside"), ("viaDotLink", "nope/../y/../x"),
+                               ("popInside", "nope/../a.txt"), ("plain", "nope/x"), ("plainDeep", "sub/nope/x/y")] {
+            try fm.createSymbolicLink(atPath: root.appendingPathComponent(name).path, withDestinationPath: target)
+        }
+        let resolved = try XCTUnwrap(realpath(root.path, nil))
+        let real = String(cString: resolved)
+        free(resolved)
+        for good in ["plain", "plainDeep", "y"] {
+            XCTAssertTrue(ArchiveExtractor.resolvesInside(good, root: real), good)
+        }
+        for bad in ["climb", "viaDotLink", "popInside"] {
+            XCTAssertFalse(ArchiveExtractor.resolvesInside(bad, root: real), bad)
+        }
+
+        // Each case on its own through verifyContained (the lexical check alone passes viaDotLink).
+        for (target, allowed) in [("nope/../../outside", false), ("nope/../y/../x", false), ("nope/x", true)] {
+            let single = try mkdir(dir, "single-\(UUID().uuidString)")
+            try fm.createSymbolicLink(atPath: single.appendingPathComponent("y").path, withDestinationPath: ".")
+            try fm.createSymbolicLink(atPath: single.appendingPathComponent("a").path, withDestinationPath: target)
+            if allowed {
+                XCTAssertNoThrow(try ArchiveExtractor.verifyContained(single), target)
+            } else {
+                XCTAssertThrowsError(try ArchiveExtractor.verifyContained(single), target) { error in
+                    XCTAssertEqual(error as? ArchiveError, .linkEscapes("a"), target)
+                }
+            }
+        }
+    }
+
+    /// End to end: a dangling link that only escapes through a dot-link after its missing part.
+    func testDanglingLinkWithDotDotAfterMissingPartIsRefused() async throws {
+        let dir = try fileActionsTempDir()
+        let out = try mkdir(dir, "out")
+        let tar = out.appendingPathComponent("evil.tar")
+        try await makeTar(at: tar, [("l", "y", 0o755, "."),
+                                    ("l", "notes.txt", 0o755, "nope/../y/../escape-proof.txt")])
+        do {
+            _ = try await ArchiveExtractor.extract(tar)
+            XCTFail("expected link rejection")
+        } catch {
+            XCTAssertEqual(error as? ArchiveError, .linkEscapes("notes.txt"))
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: out.path), ["evil.tar"])
+    }
+
     /// An escaping link next to a read-only folder: the refusal must still remove staging, which holds
     /// unchecked, unflagged content.
     func testRefusedArchiveWithReadOnlyFolderLeavesNoStaging() async throws {
