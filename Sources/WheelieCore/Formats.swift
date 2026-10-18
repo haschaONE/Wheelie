@@ -32,9 +32,26 @@ public enum FileKind: String, Sendable {
     /// Document formats that are folders on disk (packages); any other folder is `.unknown`.
     static let packageExtensions: Set<String> = ["rtfd", "pages", "key", "numbers"]
 
+    /// MPEG transport stream extensions; `.ts` and `.mts` are also TypeScript sources.
+    static let transportStreamExtensions: Set<String> = ["ts", "mts", "m2ts"]
+
+    /// False when the file can be read and has no MPEG-TS sync byte (0x47) at the start of two
+    /// consecutive packets: 188-byte packets, or 192-byte ones with a 4-byte timestamp (M2TS/AVCHD).
+    /// A file that can't be read (or doesn't exist yet) is left to its extension.
+    static func mayBeTransportStream(_ url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return true }
+        defer { try? handle.close() }
+        let head = [UInt8]((try? handle.read(upToCount: 200)) ?? Data())
+        func synced(at offset: Int, packet: Int) -> Bool {
+            head.count > offset + packet && head[offset] == 0x47 && head[offset + packet] == 0x47
+        }
+        return synced(at: 0, packet: 188) || synced(at: 4, packet: 192)
+    }
+
     public init(url: URL) {
         let ext = url.pathExtension.lowercased()
         if url.hasDirectoryPath && !FileKind.packageExtensions.contains(ext) { self = .unknown; return }
+        if FileKind.transportStreamExtensions.contains(ext) && !FileKind.mayBeTransportStream(url) { self = .unknown; return }
         if let kind = FileKind.byExtension[ext] { self = kind; return }
         guard let type = UTType(filenameExtension: ext) else { self = .unknown; return }
         if type.conforms(to: .pdf) { self = .pdf }
@@ -99,6 +116,14 @@ public enum OutputFormat: String, CaseIterable, Sendable, Identifiable {
         case .odt: return "doc"
         case .csv: return "tablecells"
         case .xlsx: return "tablecells.fill"
+        }
+    }
+
+    /// Audio-only output (the video stream is dropped).
+    public var isAudio: Bool {
+        switch self {
+        case .mp3, .m4a, .wav, .flac, .aiff, .opus: return true
+        default: return false
         }
     }
 
