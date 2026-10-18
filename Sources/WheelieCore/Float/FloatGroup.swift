@@ -6,11 +6,15 @@ public struct FloatItem: Identifiable, Equatable, Sendable {
     public var url: URL
     /// Bookmark data so a file that is moved or renamed can be found again.
     public var bookmark: Data?
+    /// The file's volume isn't reachable right now (ejected disk, NAS share not
+    /// reconnected yet). The item is kept, shown dimmed, until the volume is back.
+    public var isUnavailable: Bool
 
-    public init(id: UUID = UUID(), url: URL, bookmark: Data? = nil) {
+    public init(id: UUID = UUID(), url: URL, bookmark: Data? = nil, isUnavailable: Bool = false) {
         self.id = id
         self.url = url
         self.bookmark = bookmark
+        self.isUnavailable = isUnavailable
     }
 
     public var name: String { url.lastPathComponent }
@@ -38,6 +42,9 @@ public struct FloatGroup: Sendable {
     public private(set) var selection: Set<UUID> = []
     /// Where ⇧-click ranges start.
     public private(set) var anchor: UUID?
+    /// The moving end of a range extended with ⇧ (⇧-arrow keys continue from here).
+    /// Any other kind of selection change resets it.
+    public private(set) var focus: UUID?
 
     public init(items: [FloatItem] = []) {
         for item in items where index(ofKey: FloatItem.key(for: item.url)) == nil {
@@ -86,6 +93,7 @@ public struct FloatGroup: Sendable {
         items.removeAll { ids.contains($0.id) }
         selection.subtract(ids)
         if let anchor, ids.contains(anchor) { self.anchor = nil }
+        if let focus, ids.contains(focus) { self.focus = nil }
     }
 
     public mutating func updateURL(_ id: UUID, to url: URL, bookmark: Data?) {
@@ -112,25 +120,38 @@ public struct FloatGroup: Sendable {
 
     public func isSelected(_ id: UUID) -> Bool { selection.contains(id) }
 
+    /// Index arrow-key navigation moves from: with ⇧, the moving end of the current ⇧-range
+    /// (set only by ⇧-extending; any other selection change resets it), else the anchor,
+    /// else the last selected item.
+    public func navigationOrigin(extending: Bool) -> Int? {
+        let current = anchor.flatMap(index(of:)) ?? selectedItems.last.flatMap { index(of: $0.id) }
+        guard extending else { return current }
+        return focus.flatMap(index(of:)) ?? current
+    }
+
     public mutating func select(only id: UUID?) {
         selection = id.map { [$0] } ?? []
         anchor = id
+        focus = nil
     }
 
     public mutating func setSelection(_ ids: Set<UUID>) {
         selection = ids.intersection(items.map(\.id))
         if let anchor, !selection.contains(anchor) { self.anchor = selectedItems.first?.id }
         if anchor == nil { anchor = selectedItems.first?.id }
+        focus = nil
     }
 
     public mutating func selectAll() {
         selection = Set(items.map(\.id))
         if anchor == nil { anchor = items.first?.id }
+        focus = nil
     }
 
     public mutating func clearSelection() {
         selection = []
         anchor = nil
+        focus = nil
     }
 
     /// Finder-style click: plain click selects only the item, ⌘ toggles it,
@@ -140,11 +161,13 @@ public struct FloatGroup: Sendable {
         if modifiers.contains(.extend), let anchor, let start = index(of: anchor) {
             let range = Set(items[min(start, target)...max(start, target)].map(\.id))
             selection = modifiers.contains(.toggle) ? selection.union(range) : range
+            focus = id
             return
         }
         if modifiers.contains(.toggle) {
             if selection.contains(id) { selection.remove(id) } else { selection.insert(id) }
             anchor = id
+            focus = nil
             return
         }
         select(only: id)
@@ -162,6 +185,7 @@ public struct FloatGroup: Sendable {
             selection = hitSet
         }
         anchor = items.first { hitSet.contains($0.id) }?.id ?? anchor
+        focus = nil
     }
 
     /// Type-to-select: first item whose name starts with `prefix` (case/diacritic-insensitive).
@@ -180,16 +204,28 @@ public struct FloatGroup: Sendable {
         case moved(URL, bookmark: Data?)
         /// Deleted, trashed or otherwise gone.
         case missing
+        /// Can't be checked right now: its volume is unmounted or unreachable.
+        /// Not the same as gone; the item is kept and marked unavailable.
+        case unavailable
     }
 
-    /// Updates moved items and drops missing ones. Returns true when anything changed.
+    /// Updates moved items, marks items on unreachable volumes, and drops missing ones.
+    /// Returns true when anything changed.
     @discardableResult
     public mutating func refresh(_ check: (FloatItem) -> Check) -> Bool {
         var changed = false
         var gone: Set<UUID> = []
         for item in items {
-            switch check(item) {
-            case .present: break
+            let result = check(item)
+            if let i = index(of: item.id) {
+                let unavailable = result == .unavailable
+                if items[i].isUnavailable != unavailable {
+                    items[i].isUnavailable = unavailable
+                    changed = true
+                }
+            }
+            switch result {
+            case .present, .unavailable: break
             case .moved(let url, let bookmark):
                 if let other = index(ofKey: FloatItem.key(for: url)), items[other].id != item.id {
                     gone.insert(item.id)   // moved onto a file we already hold

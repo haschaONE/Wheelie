@@ -13,6 +13,9 @@ final class FloatManager {
     private var refreshTimer: Timer?
     private var observers: [NSObjectProtocol] = []
     private var started = false
+    /// No file checks while asleep and for a moment after waking: disks spin up and
+    /// network shares reconnect on their own schedule.
+    private var refreshPausedUntil: Date?
     private var defaults: UserDefaults { .standard }
 
     private init() {}
@@ -40,10 +43,24 @@ final class FloatManager {
                                             object: nil, queue: .main) { _ in
             MainActor.assumeIsolated { FloatManager.shared.saveNow() }
         })
-        observers.append(NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification,
-                                                                           object: nil, queue: .main) { _ in
-            MainActor.assumeIsolated { FloatManager.shared.refreshFiles() }
+        let workspace = NSWorkspace.shared.notificationCenter
+        observers.append(workspace.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated { FloatManager.shared.refreshPausedUntil = .distantFuture }
         })
+        observers.append(workspace.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated {
+                FloatManager.shared.refreshPausedUntil = Date().addingTimeInterval(FloatManager.wakeSettleDelay)
+                DispatchQueue.main.asyncAfter(deadline: .now() + FloatManager.wakeSettleDelay + 0.1) {
+                    MainActor.assumeIsolated { FloatManager.shared.refreshFiles() }
+                }
+            }
+        })
+        // Volumes coming and going: dim or restore items on them right away.
+        for name in [NSWorkspace.didMountNotification, NSWorkspace.didUnmountNotification] {
+            observers.append(workspace.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated { FloatManager.shared.refreshFiles() }
+            })
+        }
         let timer = Timer(timeInterval: 2, repeats: true) { _ in
             MainActor.assumeIsolated { FloatManager.shared.refreshFiles() }
         }
@@ -119,7 +136,14 @@ final class FloatManager {
         for float in floats { float.close() }
     }
 
+    private static let wakeSettleDelay: TimeInterval = 8
+
+    /// Checks every Float's files (off the main thread; see `FloatController.refreshFiles`).
     func refreshFiles() {
+        if let until = refreshPausedUntil {
+            guard Date() >= until else { return }
+            refreshPausedUntil = nil
+        }
         for float in floats { float.refreshFiles() }
     }
 
@@ -145,7 +169,10 @@ final class FloatManager {
             floats.append(controller)
             controller.show(animated: false)
         }
-        saveNow()   // drops Floats whose files are all gone
+        // Checks the restored files in the background: moved ones are followed, deleted ones
+        // dropped (and saved), ones on volumes that aren't mounted yet kept. Nothing is saved
+        // before that, so a share that mounts after login doesn't lose its items.
+        refreshFiles()
     }
 }
 
