@@ -6,11 +6,13 @@ import WheelieCore
 enum MetadataWindow {
     static func present(_ files: [URL]) {
         let id = CompressFeature.windowID("metadata", files)
+        let isNew = AppServices.shared.window(id: id) == nil
         let model = MetadataModel(files: files, windowID: id)
         let title = files.count == 1 ? "Metadata — \(files[0].lastPathComponent)" : "Metadata — \(files.count) Files"
         AppServices.shared.presentWindow(id: id, title: title, size: CGSize(width: 520, height: 560)) {
             MetadataView(model: model)
         }
+        if isNew, let window = AppServices.shared.window(id: id) { model.job.attach(to: window) }
     }
 }
 
@@ -23,6 +25,7 @@ final class MetadataModel: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var finished = false
     @Published private(set) var error: String?
+    let job = WindowJob()
 
     init(files: [URL], windowID: String) {
         self.files = files
@@ -38,6 +41,16 @@ final class MetadataModel: ObservableObject {
         }
     }
 
+    func start() {
+        job.start { [self] in await removeMetadata() }
+    }
+
+    /// Stops the job (closing the window does this too) and closes this window.
+    func cancel() {
+        job.cancel()
+        AppServices.shared.closeWindow(id: windowID)
+    }
+
     func removeMetadata() async {
         guard !isRunning else { return }
         isRunning = true
@@ -48,10 +61,16 @@ final class MetadataModel: ObservableObject {
             var outputs: [URL] = []
             var failures: [String] = []
             for file in files {
+                if Task.isCancelled { break }
                 do { outputs.append(try await MetadataStripper.strip(file)) }
-                catch { failures.append(files.count == 1 ? error.localizedDescription
-                                                         : "\(file.lastPathComponent): \(error.localizedDescription)") }
+                catch {
+                    if Task.isCancelled { break }
+                    failures.append(files.count == 1 ? error.localizedDescription
+                                                     : "\(file.lastPathComponent): \(error.localizedDescription)")
+                }
             }
+            // Cancelled: keep what finished, report nothing as failed.
+            if Task.isCancelled { return outputs.isEmpty ? .none : .outputs(outputs) }
             if !failures.isEmpty, outputs.isEmpty {
                 throw MetadataBatchError(message: failures.joined(separator: "\n"))
             }
@@ -62,10 +81,10 @@ final class MetadataModel: ObservableObject {
         }
         switch result {
         case .success:
-            guard error == nil else { return }
+            guard error == nil, !Task.isCancelled else { return }
             finished = true
             try? await Task.sleep(for: .seconds(1.2))
-            AppServices.shared.closeWindow(id: windowID)
+            if !Task.isCancelled { job.closeOwnWindow() }
         case .failure(let failure):
             error = failure.localizedDescription
         }
@@ -162,15 +181,15 @@ struct MetadataView: View {
             HStack {
                 if model.isRunning { ProgressView().controlSize(.small) }
                 Spacer()
-                Button("Cancel") { AppServices.shared.closeWindow(id: model.windowID) }
+                Button("Cancel") { model.cancel() }
                     .keyboardShortcut(.cancelAction)
                 Button(model.files.count == 1 ? "Remove Metadata" : "Remove Metadata from \(model.files.count) Files") {
-                    Task { await model.removeMetadata() }
+                    model.start()
                 }
                 .keyboardShortcut(.return, modifiers: .command)
                 .buttonStyle(.borderedProminent)
                 .disabled(model.isRunning || model.finished)
-                Button("Close") { AppServices.shared.closeWindow(id: model.windowID) }
+                Button("Close") { model.cancel() }
                     .keyboardShortcut("w", modifiers: .command)
                     .frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
             }

@@ -111,8 +111,10 @@ final class MetadataTests: XCTestCase {
         let pdf = dir.appendingPathComponent("doc.pdf")
         try xmpPDF().write(to: pdf)
         let before = MetadataReader.readPDF(pdf)
-        XCTAssertEqual(before.first { $0.category == .document }?.entries.first { $0.label == "Author" }?.value, "Jane Secret")
+        XCTAssertEqual(before.first { $0.category == .people }?.entries.first { $0.label == "Author" }?.value, "Jane Secret")
         XCTAssertNotNil(before.first { $0.category == .other }?.entries.first { $0.label == "XMP metadata" })
+        XCTAssertEqual(before.first { $0.category == .people }?.entries.first { $0.label == "Creator" }?.value, "Jane Secret",
+                       "catalog XMP is read too")
 
         let out = try await MetadataStripper.strip(pdf)
         XCTAssertEqual(out.lastPathComponent, "doc clean.pdf")
@@ -122,6 +124,117 @@ final class MetadataTests: XCTestCase {
         XCTAssertNil(doc.documentAttributes?[PDFDocumentAttribute.titleAttribute])
         XCTAssertFalse(MetadataReader.hasXMP(doc))
         XCTAssertFalse(String(decoding: try Data(contentsOf: out), as: UTF8.self).contains("Jane Secret"))
+    }
+
+    /// Quartz passes camera JPEGs into PDFs unchanged (DCTDecode with APP1 EXIF/GPS), and comments carry
+    /// their author's name. Both must be gone from the clean copy, with the images and comments intact.
+    func testStripPDFRemovesPhotoEXIFAndCommentAuthors() async throws {
+        let dir = try compressTempDir()
+        let jpg = dir.appendingPathComponent("photo.jpg")
+        try writeImage(noiseImage(64, 48), to: jpg, type: .jpeg, properties: privateMetadata())
+        let jpg2 = dir.appendingPathComponent("photo2.jpg")
+        try writeImage(noiseImage(48, 36), to: jpg2, type: .jpeg, properties: privateMetadata())
+        let pdf = dir.appendingPathComponent("photos.pdf")
+        try photoPDF(drawn: jpg, placed: jpg2, to: pdf, commentAuthor: "Dr. Jane Secret")
+        XCTAssertTrue(String(decoding: try Data(contentsOf: pdf), as: UTF8.self).contains("Test Lens"), "fixture embeds EXIF")
+
+        let before = MetadataReader.readPDF(pdf)
+        XCTAssertEqual(before.first { $0.category == .location }?.entries.first { $0.label == "Latitude" }?.value, "37.330000° N")
+        XCTAssertEqual(before.first { $0.category == .camera }?.entries.first { $0.label == "Make" }?.value, "ACME")
+        XCTAssertEqual(before.first { $0.category == .people }?.entries.first { $0.label == "Comment authors" }?.value,
+                       "Dr. Jane Secret")
+
+        let out = try await MetadataStripper.strip(pdf)
+        XCTAssertEqual(out.lastPathComponent, "photos clean.pdf")
+        let after = MetadataReader.readPDF(out)
+        XCTAssertTrue(after.filter { [.camera, .location, .people].contains($0.category) }.isEmpty, "\(after)")
+        let raw = String(decoding: try Data(contentsOf: out), as: UTF8.self)
+        for secret in ["Test Lens", "ACME", "TestSoft", "Jane"] { XCTAssertFalse(raw.contains(secret), secret) }
+
+        // Every photo is still there, decodes to the same pixels and has no EXIF/GPS left.
+        let originals = [64: rgba(try decode(jpg)), 48: rgba(try decode(jpg2))]
+        var images = 0
+        PDFEmbeddedMetadata.forEach(in: try XCTUnwrap(CGPDFDocument(out as CFURL))) { item in
+            guard case .image(let data, .jpegEncoded) = item else { return }
+            images += 1
+            XCTAssertTrue(ContainerStripper.jpegMetadataRanges([UInt8](data)).isEmpty)
+            guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+                  let image = CGImageSourceCreateImageAtIndex(src, 0, nil),
+                  let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any]
+            else { return XCTFail("embedded JPEG no longer decodes") }
+            XCTAssertNil(props[kCGImagePropertyGPSDictionary])
+            XCTAssertNil(props[kCGImagePropertyTIFFDictionary])
+            XCTAssertEqual(rgba(image), originals[image.width])
+        }
+        XCTAssertEqual(images, 2)
+
+        // The comment itself stays; only who wrote it (and when) is removed.
+        let doc = try XCTUnwrap(PDFDocument(url: out))
+        XCTAssertEqual(doc.pageCount, 2)
+        let notes = try XCTUnwrap(doc.page(at: 0)).annotations.filter { $0.type == "Text" }
+        XCTAssertEqual(notes.count, 1)
+        XCTAssertEqual(notes.first?.contents, "Looks good")
+        XCTAssertNil(notes.first?.userName)
+        XCTAssertNil(notes.first?.modificationDate)
+    }
+
+    /// XMP attached to pages and images, and photos in form XObjects, are found and cleaned too.
+    func testStripPDFCleansPageAndImageXMP() async throws {
+        let dir = try compressTempDir()
+        let jpg = dir.appendingPathComponent("photo.jpg")
+        try writeImage(noiseImage(32, 24), to: jpg, type: .jpeg, properties: privateMetadata())
+        let pdf = dir.appendingPathComponent("hand.pdf")
+        try handPDF(jpeg: try Data(contentsOf: jpg)).write(to: pdf)
+        let before = MetadataReader.readPDF(pdf)
+        XCTAssertNotNil(before.first { $0.category == .location }, "photo inside a form XObject is read")
+        XCTAssertEqual(before.first { $0.category == .people }?.entries.first { $0.label == "Creator" }?.value, "Jane Secret")
+
+        let out = try await MetadataStripper.strip(pdf)
+        let after = MetadataReader.readPDF(out)
+        XCTAssertTrue(after.filter { [.camera, .location, .people].contains($0.category) }.isEmpty, "\(after)")
+        XCTAssertFalse(PDFEmbeddedMetadata.hasLeftovers(in: out))
+        XCTAssertFalse(String(decoding: try Data(contentsOf: out), as: UTF8.self).contains("Jane"))
+        XCTAssertEqual(PDFDocument(url: out)?.pageCount, 1)
+    }
+
+    /// A photo stream that can't be patched in place (extra compression) must never come out as "clean".
+    func testStripPDFFailsClosedOnUnpatchablePhoto() async throws {
+        let dir = try compressTempDir()
+        let jpg = dir.appendingPathComponent("photo.jpg")
+        try writeImage(noiseImage(32, 24), to: jpg, type: .jpeg, properties: privateMetadata())
+        let pdf = dir.appendingPathComponent("flate.pdf")
+        try handPDF(jpeg: try Data(contentsOf: jpg), flate: true).write(to: pdf)
+        XCTAssertNotNil(MetadataReader.readPDF(pdf).first { $0.category == .location }, "compressed photo streams are read")
+
+        do {
+            let out = try await MetadataStripper.strip(pdf)
+            // Only acceptable if PDFKit rewrote the stream without the extra filter and it got cleaned.
+            let after = MetadataReader.readPDF(out)
+            XCTAssertTrue(after.filter { [.camera, .location, .people].contains($0.category) }.isEmpty, "\(after)")
+            XCTAssertFalse(PDFEmbeddedMetadata.hasLeftovers(in: out))
+        } catch {
+            XCTAssertEqual(error as? MetadataError, .leftover)
+            let names = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            XCTAssertFalse(names.contains { $0.contains("clean") }, "no output on failure")
+        }
+    }
+
+    func testBlankJPEGMetadataKeepsLengthAndPixels() throws {
+        let dir = try compressTempDir()
+        let jpg = dir.appendingPathComponent("photo.jpg")
+        try writeImage(noiseImage(80, 60), to: jpg, type: .jpeg, properties: privateMetadata())
+        var data = try Data(contentsOf: jpg)
+        data += Data("TRAILER secret".utf8)
+
+        let blank = try XCTUnwrap(ContainerStripper.blankJPEGMetadata(data))
+        XCTAssertEqual(blank.count, data.count, "offsets inside a PDF must not move")
+        XCTAssertNil(ContainerStripper.blankJPEGMetadata(blank), "nothing left to blank")
+        XCTAssertFalse(String(decoding: blank, as: UTF8.self).contains("secret"))
+        let src = try XCTUnwrap(CGImageSourceCreateWithData(blank as CFData, nil))
+        let props = try XCTUnwrap(CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any])
+        XCTAssertNil(props[kCGImagePropertyGPSDictionary])
+        XCTAssertNil(props[kCGImagePropertyExifDictionary].flatMap { ($0 as? [CFString: Any])?[kCGImagePropertyExifLensModel] })
+        XCTAssertEqual(rgba(try XCTUnwrap(CGImageSourceCreateImageAtIndex(src, 0, nil))), rgba(try decode(jpg)))
     }
 
     func testStripVideoRemovesTagsAndLocation() async throws {
@@ -431,6 +544,138 @@ final class CompressTests: XCTestCase {
         XCTAssertEqual(CompressionOptions(goal: .reduction(40)).targetBytes(forOriginal: 1000), 600)
         XCTAssertNil(CompressionOptions(goal: .preset).targetBytes(forOriginal: 1000))
     }
+
+    /// Huge typed sizes used to trap in Int(Double) and kill the app; they must just be invalid.
+    func testTargetSizeParsingNeverOverflows() {
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.numberStyle = .decimal
+        formatter.maximumFractionDigits = 2
+        formatter.usesGroupingSeparator = false
+        let kb = 1_000.0, mb = 1_000_000.0
+        for (text, unit) in [("1e20", mb), ("1e20", kb), ("10000000000000", mb), ("9300000000000", mb),
+                             ("9999999999999999", kb), ("1e308", mb), ("1000001", mb)] {
+            XCTAssertNil(TargetSize.parse(text, unitBytes: unit, formatter: formatter), text)
+        }
+        for text in ["", "abc", "-1", "0", "nan", "inf"] {
+            XCTAssertNil(TargetSize.parse(text, unitBytes: mb, formatter: formatter), text)
+        }
+        XCTAssertEqual(TargetSize.parse("2.5", unitBytes: mb, formatter: formatter), 2_500_000)
+        XCTAssertEqual(TargetSize.parse(" 2,5 ", unitBytes: mb, formatter: formatter), 2_500_000)
+        XCTAssertEqual(TargetSize.parse("1000000", unitBytes: mb, formatter: formatter), TargetSize.maxBytes)
+        XCTAssertEqual(TargetSize.parse("0.5", unitBytes: kb, formatter: formatter), 500, "below 1 KB is reported, not hidden")
+    }
+
+    /// Only GIF output keeps frames, so multi-page/sequence inputs must be refused, not cut to page 1.
+    func testMultiPageImagesAreRefused() async throws {
+        let dir = try compressTempDir()
+        let tiff = dir.appendingPathComponent("scan.tiff")
+        let dest = try XCTUnwrap(CGImageDestinationCreateWithURL(tiff as CFURL, UTType.tiff.identifier as CFString, 3, nil))
+        for _ in 0..<3 { CGImageDestinationAddImage(dest, noiseImage(400, 300), nil) }
+        XCTAssertTrue(CGImageDestinationFinalize(dest))
+        XCTAssertEqual(CGImageSourceGetCount(try XCTUnwrap(CGImageSourceCreateWithURL(tiff as CFURL, nil))), 3)
+
+        do {
+            _ = try await Compressor.compress(tiff, options: CompressionOptions(goal: .preset))
+            XCTFail("a 3-page TIFF must not become a 1-page JPEG")
+        } catch {
+            XCTAssertEqual(error as? CompressionError, .multiFrame(3))
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), ["scan.tiff"])
+
+        XCTAssertThrowsError(try ImageCompressor.checkFrames(4, type: "public.heics", codec: .lossy(.heic)))
+        XCTAssertThrowsError(try ImageCompressor.checkFrames(4, type: "public.avif", codec: .lossy(.heic)))
+        XCTAssertThrowsError(try ImageCompressor.checkFrames(2, type: UTType.tiff.identifier, codec: .png)) {
+            XCTAssertEqual($0 as? CompressionError, .multiFrame(2))
+        }
+        XCTAssertThrowsError(try ImageCompressor.checkFrames(2, type: UTType.png.identifier, codec: .png)) {
+            XCTAssertEqual($0 as? CompressionError, .animated)
+        }
+        XCTAssertNoThrow(try ImageCompressor.checkFrames(9, type: UTType.gif.identifier, codec: .gif))
+        XCTAssertNoThrow(try ImageCompressor.checkFrames(1, type: UTType.tiff.identifier, codec: .lossy(.jpeg)))
+        XCTAssertNoThrow(try ImageCompressor.checkFrames(2, type: UTType.jpeg.identifier, codec: .lossy(.jpeg)),
+                         "MPF secondary images (gain maps, stereo pairs) are not pages")
+    }
+
+    /// A symlink used to be measured as the link itself (~250 bytes), so every compression failed.
+    func testSymlinkedInputIsMeasuredByItsTarget() async throws {
+        let dir = try compressTempDir()
+        let jpg = dir.appendingPathComponent("photo.jpg")
+        try writeImage(noiseImage(800, 600), to: jpg, type: .jpeg, properties: [:], quality: 1)
+        let link = dir.appendingPathComponent("link.jpg")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: jpg)
+        let size = ByteSize.of(jpg)
+        XCTAssertGreaterThan(size, 10_000)
+        XCTAssertEqual(ByteSize.of(link), size)
+
+        let preset = try await Compressor.compress(link, options: CompressionOptions(goal: .preset))
+        XCTAssertEqual(preset.originalBytes, size)
+        XCTAssertLessThan(preset.compressedBytes, size)
+        let sized = try await Compressor.compress(link, options: CompressionOptions(goal: .reduction(50)))
+        XCTAssertLessThanOrEqual(sized.compressedBytes, size / 2)
+    }
+
+    func testGIFLoopCountMapsToFFmpegRepeats() async throws {
+        XCTAssertEqual(GIFEncoder.ffmpegLoop(nil), "-1")
+        XCTAssertEqual(GIFEncoder.ffmpegLoop(1), "-1", "ImageIO 1 = plays once")
+        XCTAssertEqual(GIFEncoder.ffmpegLoop(0), "0", "forever")
+        XCTAssertEqual(GIFEncoder.ffmpegLoop(2), "1")
+        XCTAssertEqual(GIFEncoder.ffmpegLoop(5), "4")
+
+        try XCTSkipIf(Tools.locate("ffmpeg") == nil, "ffmpeg not installed")
+        let dir = try compressTempDir()
+        for loop in ["-1", "0", "3"] {
+            let gif = dir.appendingPathComponent("loop\(loop).gif")
+            try await Tools.run("ffmpeg", ["-nostdin", "-loglevel", "error", "-f", "lavfi", "-i",
+                                           "testsrc2=size=160x120:rate=10:duration=1", "-t", "1",
+                                           "-vf", "noise=alls=20:allf=t,split[a][b];[a]palettegen[p];[b][p]paletteuse",
+                                           "-loop", loop, gif.path])
+            let before = ImageCompressor.loopCount(try XCTUnwrap(CGImageSourceCreateWithURL(gif as CFURL, nil)))
+            let result = try await Compressor.compress(gif, options: CompressionOptions(goal: .preset, imageStrength: .strong))
+            let after = ImageCompressor.loopCount(try XCTUnwrap(CGImageSourceCreateWithURL(result.output as CFURL, nil)))
+            XCTAssertEqual(after ?? 1, before ?? 1, "ffmpeg -loop \(loop): play count must not change")
+        }
+    }
+
+    /// The menu's open panel must offer everything the engines accept, including MKV (a dynamic UTType).
+    func testOpenPanelTypesCoverEveryAcceptedMediaExtension() throws {
+        let types = CompressInputs.contentTypes
+        for (ext, kind) in FileKind.byExtension where [.image, .video, .audio].contains(kind) {
+            let type = try XCTUnwrap(UTType(filenameExtension: ext), ext)
+            XCTAssertTrue(types.contains { type.conforms(to: $0) }, ext)
+        }
+        for ext in ["jpg", "png", "mp4", "mov", "mp3", "pdf"] {
+            let type = try XCTUnwrap(UTType(filenameExtension: ext))
+            XCTAssertTrue(types.contains { type.conforms(to: $0) }, ext)
+        }
+    }
+
+    /// Closing a Compress/Metadata window cancels its task; the running tool must stop with it.
+    func testToolCaptureStopsWhenCancelled() async throws {
+        let start = Date()
+        let task = Task { try await Tools.capture("/bin/sleep", ["30"]) }
+        try await Task.sleep(for: .milliseconds(200))
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("expected cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 10)
+
+        let early = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await Tools.capture("/bin/sleep", ["30"])
+        }
+        do {
+            _ = try await early.value
+            XCTFail("expected cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 10)
+    }
 }
 
 // MARK: - Fixtures
@@ -521,6 +766,80 @@ private func rgba(_ image: CGImage) -> [UInt8] {
     let buffer = UnsafeBufferPointer(start: ctx.data!.assumingMemoryBound(to: UInt8.self), count: image.width * image.height * 4)
     // Row 0 of the bitmap is the top row of the image.
     return Array(buffer)
+}
+
+/// Two pages of camera JPEGs, made the way users make them: a Quartz PDF context drawing the decoded
+/// photo, and PDFPage(image:). Page 1 gets a sticky-note comment by `commentAuthor`.
+private func photoPDF(drawn jpg: URL, placed jpg2: URL, to pdf: URL, commentAuthor: String) throws {
+    let src = try XCTUnwrap(CGImageSourceCreateWithURL(jpg as CFURL, nil))
+    let image = try XCTUnwrap(CGImageSourceCreateImageAtIndex(src, 0, nil))
+    let drawn = pdf.deletingLastPathComponent().appendingPathComponent("drawn.pdf")
+    var box = CGRect(x: 0, y: 0, width: 200, height: 200)
+    let context = try XCTUnwrap(CGContext(drawn as CFURL, mediaBox: &box, nil))
+    context.beginPDFPage(nil)
+    context.draw(image, in: CGRect(x: 10, y: 10, width: 64, height: 48))
+    context.endPDFPage()
+    context.closePDF()
+
+    let doc = try XCTUnwrap(PDFDocument(url: drawn))
+    doc.insert(try XCTUnwrap(PDFPage(image: try XCTUnwrap(NSImage(contentsOf: jpg2)))), at: 1)
+    let note = PDFAnnotation(bounds: CGRect(x: 100, y: 100, width: 20, height: 20), forType: .text, withProperties: nil)
+    note.userName = commentAuthor
+    note.contents = "Looks good"
+    note.modificationDate = Date()
+    try XCTUnwrap(doc.page(at: 0)).addAnnotation(note)
+    XCTAssertTrue(doc.write(to: pdf))
+}
+
+/// Hand-written PDF: a page with its own XMP, drawing a form XObject that holds a camera JPEG
+/// (with EXIF/GPS) which also carries an XMP packet.
+private func handPDF(jpeg: Data, flate: Bool = false) -> Data {
+    func xmp(_ creator: String) -> String {
+        """
+        <?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF \
+        xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" \
+        xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:creator><rdf:Seq><rdf:li>\(creator)</rdf:li></rdf:Seq>\
+        </dc:creator></rdf:Description></rdf:RDF></x:xmpmeta><?xpacket end="w"?>
+        """
+    }
+    func stream(_ dict: String, _ body: Data) -> Data {
+        Data("<< \(dict) /Length \(body.count) >>\nstream\n".utf8) + body + Data("\nendstream".utf8)
+    }
+    let pageXMP = Data(xmp("Jane Secret").utf8), imageXMP = Data(xmp("Jane Photographer").utf8)
+    let content = Data("q 1 0 0 1 10 10 cm /Fm1 Do Q".utf8), form = Data("q 32 0 0 24 0 0 cm /Im1 Do Q".utf8)
+    let objects: [Data] = [
+        Data("<< /Type /Catalog /Pages 2 0 R >>".utf8),
+        Data("<< /Type /Pages /Kids [3 0 R] /Count 1 /Resources << /XObject << /Fm1 5 0 R >> >> >>".utf8),
+        Data("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R /Metadata 7 0 R >>".utf8),
+        stream("", content),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 100 100] /Resources << /XObject << /Im1 6 0 R >> >>", form),
+        stream("/Type /XObject /Subtype /Image /Width 32 /Height 24 /ColorSpace /DeviceRGB /BitsPerComponent 8 "
+               + (flate ? "/Filter [/FlateDecode /DCTDecode]" : "/Filter /DCTDecode") + " /Metadata 8 0 R",
+               flate ? zlib(jpeg) : jpeg),
+        stream("/Type /Metadata /Subtype /XML", pageXMP),
+        stream("/Type /Metadata /Subtype /XML", imageXMP),
+    ]
+    var out = Data("%PDF-1.4\n".utf8)
+    var offsets: [Int] = []
+    for (i, object) in objects.enumerated() {
+        offsets.append(out.count)
+        out += Data("\(i + 1) 0 obj\n".utf8) + object + Data("\nendobj\n".utf8)
+    }
+    let xref = out.count
+    var tail = "xref\n0 \(objects.count + 1)\n0000000000 65535 f \n"
+    for offset in offsets { tail += String(format: "%010d 00000 n \n", offset) }
+    tail += "trailer\n<< /Size \(objects.count + 1) /Root 1 0 R >>\nstartxref\n\(xref)\n%%EOF\n"
+    return out + Data(tail.utf8)
+}
+
+/// zlib stream (RFC 1950) for PDF's FlateDecode; Foundation's `.zlib` is raw DEFLATE.
+private func zlib(_ data: Data) -> Data {
+    let deflated = (try? (data as NSData).compressed(using: .zlib) as Data) ?? Data()
+    var a: UInt32 = 1, b: UInt32 = 0
+    for byte in data { a = (a + UInt32(byte)) % 65521; b = (b + a) % 65521 }
+    let adler = b << 16 | a
+    return Data([0x78, 0x9C]) + deflated
+        + Data([UInt8(adler >> 24), UInt8(adler >> 16 & 0xFF), UInt8(adler >> 8 & 0xFF), UInt8(adler & 0xFF)])
 }
 
 /// Minimal hand-written PDF with an Info dictionary and an XMP packet in the catalog.

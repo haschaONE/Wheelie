@@ -239,14 +239,49 @@ public enum MetadataReader {
         let attrs = doc.documentAttributes ?? [:]
         func attr(_ key: PDFDocumentAttribute) -> Any? { attrs[key] ?? attrs[key.rawValue] }
         c.add(.document, "Title", attr(.titleAttribute))
-        c.add(.document, "Author", attr(.authorAttribute))
+        c.add(.people, "Author", attr(.authorAttribute))
         c.add(.document, "Subject", attr(.subjectAttribute))
         c.add(.document, "Keywords", attr(.keywordsAttribute))
         c.add(.software, "Created with", attr(.creatorAttribute))
         c.add(.software, "Producer", attr(.producerAttribute))
         c.add(.dates, "Created", attr(.creationDateAttribute))
         c.add(.dates, "Modified", attr(.modificationDateAttribute))
-        if hasXMP(doc) { c.add(.other, "XMP metadata", "Present") }
+
+        let commenters = PDFEmbeddedMetadata.annotationAuthors(doc)
+        if !commenters.isEmpty { c.add(.people, "Comment authors", commenters.joined(separator: ", ")) }
+
+        if let catalogXMP = xmpData(doc) {
+            c.add(.other, "XMP metadata", "Present")
+            if let meta = CGImageMetadataCreateFromXMPData(catalogXMP as CFData) { collectXMP(meta, into: &c) }
+        }
+
+        // Photos placed in the PDF keep their own EXIF/GPS/XMP; so can pages and forms (XMP).
+        if let ref = doc.documentRef {
+            var imagesWithMetadata = 0
+            PDFEmbeddedMetadata.forEach(in: ref) { item in
+                switch item {
+                case .image(let data, let format):
+                    guard format == .jpegEncoded || format == .JPEG2000,
+                          let src = CGImageSourceCreateWithData(data as CFData, nil) else { return }
+                    var found = format == .jpegEncoded && !ContainerStripper.jpegMetadataRanges([UInt8](data)).isEmpty
+                    let index = CGImageSourceGetPrimaryImageIndex(src)
+                    if let props = CGImageSourceCopyPropertiesAtIndex(src, index, nil) as? [String: Any] {
+                        let before = c.count
+                        collectImageProperties(props, into: &c)
+                        found = found || c.count > before
+                    }
+                    if let meta = CGImageSourceCopyMetadataAtIndex(src, index, nil) {
+                        let before = c.count
+                        collectXMP(meta, into: &c)
+                        found = found || c.count > before
+                    }
+                    if found { imagesWithMetadata += 1 }
+                case .xmp(let data):
+                    if let meta = CGImageMetadataCreateFromXMPData(data as CFData) { collectXMP(meta, into: &c) }
+                }
+            }
+            if imagesWithMetadata > 0 { c.add(.other, "Images with own metadata", "\(imagesWithMetadata)") }
+        }
         return c.groups
     }
 
@@ -254,6 +289,15 @@ public enum MetadataReader {
         guard let catalog = doc.documentRef?.catalog else { return false }
         var stream: CGPDFStreamRef?
         return CGPDFDictionaryGetStream(catalog, "Metadata", &stream)
+    }
+
+    /// The catalog's XMP packet, decoded.
+    static func xmpData(_ doc: PDFDocument) -> Data? {
+        guard let catalog = doc.documentRef?.catalog else { return nil }
+        var stream: CGPDFStreamRef?
+        guard CGPDFDictionaryGetStream(catalog, "Metadata", &stream), let stream else { return nil }
+        var format = CGPDFDataFormat.raw
+        return (CGPDFStreamCopyData(stream, &format) as Data?) ?? Data()
     }
 
     // MARK: Video / audio
@@ -367,6 +411,9 @@ public enum MetadataReader {
             list.append(MetadataEntry(label: label, value: text))
             entries[category] = list
         }
+
+        /// Number of entries collected so far.
+        var count: Int { entries.values.reduce(0) { $0 + $1.count } }
 
         var groups: [MetadataGroup] {
             entries.keys.sorted().map { MetadataGroup(category: $0, entries: entries[$0]!) }

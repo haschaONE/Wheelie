@@ -69,7 +69,7 @@ enum ImageCompressor {
         let hasAlpha = props[kCGImagePropertyHasAlpha] as? Bool ?? false
         let codec = codec(forType: type, hasAlpha: hasAlpha)
         let frames = CGImageSourceGetCount(src)
-        if frames > 1, codec == .png || codec == .webp { throw CompressionError.animated }
+        try checkFrames(frames, type: type, codec: codec)
 
         let strength = options.imageStrength
         var limit = options.imageSize.maxPixels ?? Int.max
@@ -138,6 +138,19 @@ enum ImageCompressor {
         else { throw CompressionError.imageFailed }
         try data.write(to: output, options: .atomic)
         return (output, codec.fileExtension)
+    }
+
+    /// Only GIF output keeps every frame; the other encoders write the primary image alone. So a
+    /// multi-page TIFF, an image sequence (HEICS, animated AVIF) or an animated PNG/WebP is refused
+    /// rather than silently cut down to its first page. JPEG and HEIC stills may report extra images
+    /// (MPF gain maps and stereo pairs, HEIF auxiliaries) next to the photo itself; those stay allowed.
+    static func checkFrames(_ frames: Int, type: String?, codec: Codec) throws {
+        guard frames > 1, codec != .gif else { return }
+        switch type {
+        case UTType.png.identifier, "org.webmproject.webp": throw CompressionError.animated
+        case UTType.jpeg.identifier, UTType.heic.identifier, UTType.heif.identifier: return
+        default: throw CompressionError.multiFrame(frames)
+        }
     }
 
     /// Decodes the source with EXIF orientation applied, at `baseEdge * scale` on the long side.
@@ -209,6 +222,7 @@ enum ImageCompressor {
         return try Data(contentsOf: out)
     }
 
+    /// ImageIO's kCGImagePropertyGIFLoopCount: total plays, 0 = forever (see `GIFEncoder.ffmpegLoop`).
     static func loopCount(_ src: CGImageSource) -> Int? {
         guard let props = CGImageSourceCopyProperties(src, nil) as? [CFString: Any],
               let gif = props[kCGImagePropertyGIFDictionary] as? [CFString: Any]
@@ -235,11 +249,19 @@ struct GIFEncoder {
         filters.append("split[a][b];[a]palettegen=max_colors=\(colors):stats_mode=\(stats)[p];"
                        + "[b][p]paletteuse=dither=bayer:bayer_scale=3" + (animated ? ":diff_mode=rectangle" : ""))
         let out = workDir.appendingPathComponent("gif-\(colors)-\(w).gif")
-        // GIFs without a loop count play once; ffmpeg's -loop -1 means "no loop", 0 "forever".
-        let loop = loopCount.map(String.init) ?? "-1"
         try await Tools.run("ffmpeg", ["-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", source.path,
-                                       "-vf", filters.joined(separator: ","), "-loop", loop, "-f", "gif", out.path])
+                                       "-vf", filters.joined(separator: ","), "-loop", Self.ffmpegLoop(loopCount),
+                                       "-f", "gif", out.path])
         defer { try? FileManager.default.removeItem(at: out) }
         return try Data(contentsOf: out)
+    }
+
+    /// ImageIO's GIF loop count is the total number of plays (1 without a NETSCAPE block, NETSCAPE
+    /// value + 1 otherwise, 0 forever); ffmpeg's -loop is the NETSCAPE repeat count (-1 = play once,
+    /// 0 = forever, n = n extra plays).
+    static func ffmpegLoop(_ imageIOLoopCount: Int?) -> String {
+        guard let plays = imageIOLoopCount else { return "-1" }
+        if plays == 0 { return "0" }
+        return plays > 1 ? String(plays - 1) : "-1"
     }
 }

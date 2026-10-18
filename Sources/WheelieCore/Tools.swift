@@ -34,13 +34,24 @@ public enum Tools {
 
     /// Like `run`, but returns stdout and stderr (ffprobe, ffmpeg loudnorm/silencedetect output, ...).
     /// `name` is looked up with `locate`, or used as-is when it is an absolute path.
+    /// Cancelling the calling task terminates the tool and throws `CancellationError`.
     @discardableResult
     public static func capture(_ name: String, _ arguments: [String]) async throws -> (stdout: String, stderr: String) {
         let exe = name.hasPrefix("/") ? URL(fileURLWithPath: name) : locate(name)
         guard let exe, FileManager.default.isExecutableFile(atPath: exe.path) else { throw ToolError.missing(name) }
         let isFFmpeg = ["ffmpeg", "ffprobe"].contains(exe.lastPathComponent)
         let finalArguments = isFFmpeg ? try hardenFFmpegInputs(arguments, probe: exe.lastPathComponent == "ffprobe") : arguments
-        return try await withCheckedThrowingContinuation { cont in
+        let handle = CancellableProcess()
+        return try await withTaskCancellationHandler {
+            try await launch(exe, finalArguments, handle: handle)
+        } onCancel: {
+            handle.cancel()
+        }
+    }
+
+    private static func launch(_ exe: URL, _ finalArguments: [String],
+                               handle: CancellableProcess) async throws -> (stdout: String, stderr: String) {
+        try await withCheckedThrowingContinuation { cont in
             let process = Process()
             process.executableURL = exe
             process.arguments = finalArguments
@@ -59,14 +70,56 @@ public enum Tools {
                 errData.append(errPipe.fileHandleForReading.readDataToEndOfFile())
                 let stdout = String(decoding: outData.value, as: UTF8.self)
                 let stderr = String(decoding: errData.value, as: UTF8.self)
-                if p.terminationStatus == 0 {
+                if handle.isCancelled {
+                    cont.resume(throwing: CancellationError())
+                } else if p.terminationStatus == 0 {
                     cont.resume(returning: (stdout, stderr))
                 } else {
                     cont.resume(throwing: ToolError.failed(tool: exe.lastPathComponent, status: p.terminationStatus, stderr: stderr))
                 }
             }
-            do { try process.run() } catch { cont.resume(throwing: error) }
+            func abandon(_ error: Error) {
+                outPipe.fileHandleForReading.readabilityHandler = nil
+                errPipe.fileHandleForReading.readabilityHandler = nil
+                cont.resume(throwing: error)
+            }
+            do {
+                if try !handle.run(process) { abandon(CancellationError()) }
+            } catch {
+                abandon(error)
+            }
         }
+    }
+}
+
+/// A tool process that a task cancellation can stop, whether it arrives before or after launch.
+final class CancellableProcess: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    /// Launches `process` unless cancellation already happened (then returns false).
+    func run(_ process: Process) throws -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { return false }
+        try process.run()
+        self.process = process
+        return true
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let process = self.process
+        lock.unlock()
+        if let process, process.isRunning { process.terminate() }
+    }
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
     }
 }
 

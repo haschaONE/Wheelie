@@ -20,10 +20,12 @@ enum CompressionMode: String, CaseIterable, Identifiable {
 enum CompressionWindow {
     static func present(_ files: [URL]) {
         let id = CompressFeature.windowID("compress", files)
+        let isNew = AppServices.shared.window(id: id) == nil
         let model = CompressionModel(files: files, windowID: id)
         AppServices.shared.presentWindow(id: id, title: "Compression Settings", size: CGSize(width: 500, height: 560)) {
             CompressionSettingsView(model: model)
         }
+        if isNew, let window = AppServices.shared.window(id: id) { model.job.attach(to: window) }
     }
 }
 
@@ -47,6 +49,7 @@ final class CompressionModel: ObservableObject {
     @Published private(set) var isRunning = false
     @Published var finished = false
     let windowID: String
+    let job = WindowJob()
 
     init(files: [URL], windowID: String) {
         self.windowID = windowID
@@ -75,6 +78,16 @@ final class CompressionModel: ObservableObject {
         return before > 0 ? max(0, 1 - Double(after) / Double(before)) : nil
     }
 
+    func start(options: CompressionOptions) {
+        job.start { [self] in await compress(options: options) }
+    }
+
+    /// Stops the job (closing the window does this too) and closes this window.
+    func cancel() {
+        job.cancel()
+        AppServices.shared.closeWindow(id: windowID)
+    }
+
     func compress(options: CompressionOptions) async {
         guard !isRunning else { return }
         // Re-running retries what didn't finish; if everything finished, start over.
@@ -90,23 +103,27 @@ final class CompressionModel: ObservableObject {
             var outputs: [URL] = []
             var firstError: Error?
             for i in indices {
+                if Task.isCancelled { break }
                 items[i].state = .working
                 do {
                     let result = try await Compressor.compress(items[i].url, options: options)
                     items[i].state = .done(result)
                     outputs.append(result.output)
                 } catch {
+                    if Task.isCancelled { items[i].state = .pending; break }
                     items[i].state = .failed(error.localizedDescription)
                     firstError = firstError ?? error
                 }
             }
+            // Cancelled: keep what finished, report nothing as failed.
+            if Task.isCancelled { return outputs.isEmpty ? .none : .outputs(outputs) }
             if outputs.isEmpty, let firstError { throw firstError }
             return .outputs(outputs)
         }
-        if case .success = outcome, failures.isEmpty {
+        if case .success = outcome, failures.isEmpty, !Task.isCancelled {
             finished = true
             try? await Task.sleep(for: .seconds(1.6))
-            AppServices.shared.closeWindow(id: windowID)
+            if !Task.isCancelled { job.closeOwnWindow() }
         }
     }
 }
@@ -210,13 +227,14 @@ struct CompressionSettingsView: View {
     }
 
     /// Parses as you type (so ⌘↩ never uses a stale value); accepts "2,5" and "2.5".
+    /// Out-of-range text ("1e20", 14+ digits) is flagged instead of converted, so it can't trap.
     private func parseTargetText(_ text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespaces)
-        let value = Self.numberFormatter.number(from: trimmed)?.doubleValue
-            ?? Double(trimmed.replacingOccurrences(of: ",", with: "."))
-        guard let value, value.isFinite, value > 0 else { targetTextInvalid = true; return }
+        guard let bytes = TargetSize.parse(text, unitBytes: unitBytes, formatter: Self.numberFormatter) else {
+            targetTextInvalid = true
+            return
+        }
         targetTextInvalid = false
-        targetBytes = Int((value * unitBytes).rounded())
+        targetBytes = Int(bytes)
     }
 
     @ViewBuilder private var targetSizeControls: some View {
@@ -258,8 +276,8 @@ struct CompressionSettingsView: View {
 
     private var targetSizeError: String? {
         if targetTextInvalid { return "Enter a target size between 1 KB and 1 TB." }
-        if targetBytes < 1_000 { return "Enter a target size of at least 1 KB." }
-        if targetBytes > 1_000_000_000_000 { return "Enter a target size between 1 KB and 1 TB." }
+        if Int64(targetBytes) < TargetSize.minBytes { return "Enter a target size of at least 1 KB." }
+        if Int64(targetBytes) > TargetSize.maxBytes { return "Enter a target size between 1 KB and 1 TB." }
         return nil
     }
 
@@ -318,16 +336,16 @@ struct CompressionSettingsView: View {
         HStack(spacing: 10) {
             status
             Spacer()
-            Button("Cancel") { AppServices.shared.closeWindow(id: model.windowID) }
+            Button("Cancel") { model.cancel() }
                 .keyboardShortcut(.cancelAction)
             Button(model.isRunning ? "Compressing…" : "Compress") {
-                Task { await model.compress(options: options) }
+                model.start(options: options)
             }
             .keyboardShortcut(.return, modifiers: .command)
             .buttonStyle(.borderedProminent)
             .disabled(model.isRunning || model.finished || validationError != nil)
             // ⌘W closes too (menu-bar apps have no File menu).
-            Button("Close") { AppServices.shared.closeWindow(id: model.windowID) }
+            Button("Close") { model.cancel() }
                 .keyboardShortcut("w", modifiers: .command)
                 .frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
         }
