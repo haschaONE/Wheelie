@@ -21,6 +21,18 @@ struct VideoCropEditor: View {
     private var width: Int { Int(player.pixelSize.width) }
     private var height: Int { Int(player.pixelSize.height) }
     private var output: VideoCropRect { VideoCropMath.even(rect, width: width, height: height) }
+    /// Horizontal stretch of a displayed pixel (1 for square pixels; 4/3 for HDV).
+    private var pixelAspect: Double { player.info?.displayPixelAspect ?? 1 }
+    /// The chosen ratio is the displayed shape; the crop math works in stored pixels.
+    private var pixelRatio: Double? { VideoCropMath.pixelRatio(aspect.ratio, pixelAspect: pixelAspect) }
+
+    private var outputLabel: String {
+        var text = "Output \(output.width) × \(output.height) px"
+        if abs(pixelAspect - 1) > 0.01 {
+            text += " (shown as \(Int((Double(output.width) * pixelAspect).rounded())) × \(output.height))"
+        }
+        return text
+    }
 
     private var blocker: String? {
         guard player.info != nil else { return nil }
@@ -40,7 +52,7 @@ struct VideoCropEditor: View {
                 VideoToolsPreview(player: player, unavailableMessage:
                     "Video preview is unavailable for this file. You can still export the crop.") { mapping in
                     if rect.width > 0 {
-                        VideoCropOverlay(mapping: mapping, rect: $rect, ratio: aspect.ratio, width: width, height: height)
+                        VideoCropOverlay(mapping: mapping, rect: $rect, ratio: pixelRatio, width: width, height: height)
                     }
                 }
                 .frame(minHeight: 280)
@@ -70,7 +82,7 @@ struct VideoCropEditor: View {
                     VideoToolsPixelField(title: "Height", value: field(\.height))
                         .accessibilityLabel("Crop height in pixels")
                     Spacer()
-                    Text("Output \(output.width) × \(output.height) px")
+                    Text(outputLabel)
                         .font(.system(.callout, design: .monospaced))
                         .foregroundStyle(.secondary)
                 }
@@ -81,7 +93,7 @@ struct VideoCropEditor: View {
             if rect == .zero { rect = VideoCropMath.largest(ratio: nil, width: width, height: height).cgRect }
         }
         .onChange(of: aspect) {
-            rect = VideoCropMath.largest(ratio: aspect.ratio, width: width, height: height).cgRect
+            rect = VideoCropMath.largest(ratio: pixelRatio, width: width, height: height).cgRect
         }
     }
 
@@ -91,7 +103,7 @@ struct VideoCropEditor: View {
             var r = output
             r[keyPath: key] = value
             var cg = r.cgRect
-            if let ratio = aspect.ratio {
+            if let ratio = pixelRatio {
                 if key == \.width { cg.size.height = cg.width / ratio }
                 if key == \.height { cg.size.width = cg.height * ratio }
             }

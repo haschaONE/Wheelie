@@ -15,6 +15,7 @@ final class VideoJoinModel: ObservableObject {
     @Published private(set) var thumbnails: [URL: CGImage] = [:]
     @Published private(set) var player: VideoToolsPlayer?
     private var loaded = false
+    private var isTornDown = false
 
     init(urls: [URL]) { clips = urls.map { Clip(url: $0) } }
 
@@ -22,12 +23,16 @@ final class VideoJoinModel: ObservableObject {
         guard !loaded else { return }
         loaded = true
         for clip in clips {
+            // Stop once the window has closed.
+            guard !Task.isCancelled, !isTornDown else { return }
             do {
                 let info = try await VideoToolProbe.probe(clip.url)
                 infos[clip.url] = info
                 if !info.hasVideo { failures[clip.url] = "No video track" }
+                guard !Task.isCancelled, !isTornDown else { return }
                 let time = min(1, info.duration / 2)
-                thumbnails[clip.url] = try? await VideoToolFrames.frame(clip.url, at: time, maxHeight: 72, duration: info.duration)
+                thumbnails[clip.url] = try? await VideoToolFrames.frame(clip.url, at: time, maxHeight: 72,
+                                                                        duration: info.duration, exact: false)
             } catch {
                 failures[clip.url] = "Couldn't read this file"
             }
@@ -35,7 +40,8 @@ final class VideoJoinModel: ObservableObject {
     }
 
     func preview(_ clip: Clip?) {
-        guard player?.url != clip?.url else { return }
+        guard !isTornDown, player?.url != clip?.url else { return }
+        // The old player's load may still be running; tearDown makes it stop without starting work.
         player?.tearDown()
         guard let clip else { player = nil; return }
         let model = VideoToolsPlayer(url: clip.url)
@@ -43,7 +49,10 @@ final class VideoJoinModel: ObservableObject {
         Task { await model.load() }
     }
 
-    func tearDown() { player?.tearDown() }
+    func tearDown() {
+        isTornDown = true
+        player?.tearDown()
+    }
 
     func orderByName() {
         clips.sort { $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending }

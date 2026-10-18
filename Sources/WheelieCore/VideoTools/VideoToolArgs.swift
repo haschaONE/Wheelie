@@ -34,6 +34,21 @@ public struct VideoToolEncoding: Equatable, Sendable {
             return mp4
         }
     }
+
+    /// Audio codecs the MP4/QuickTime muxer accepts, so copying them can't fail.
+    static let mp4AudioCodecs: Set<String> = ["aac", "mp3", "mp2", "ac3", "eac3", "alac", "opus", "flac"]
+
+    /// Audio settings when only the picture changes: copy the source's audio when this output keeps
+    /// its container or can hold its codec (`codec` nil = unknown), else re-encode with `audioArgs`.
+    /// WMV's WMA, 3GP's AMR and FLV's Nellymoser can't go into the MP4 they are written as.
+    public func audioArgs(keeping source: URL, codec: String?) -> [String] {
+        let copy = ["-c:a", "copy"]
+        if source.pathExtension.lowercased() == fileExtension { return copy }
+        if ["mp4", "m4v", "mov"].contains(fileExtension), let codec, Self.mp4AudioCodecs.contains(codec.lowercased()) {
+            return copy
+        }
+        return audioArgs
+    }
 }
 
 public enum VideoSnapshotFormat: String, CaseIterable, Sendable, Identifiable {
@@ -103,6 +118,8 @@ public enum VideoToolArgs {
     }
 
     /// Letterboxes every clip into width×height at one frame rate and concatenates them.
+    /// Non-square pixels are first resampled to square ones at their displayed shape, so anamorphic
+    /// clips (HDV, DV, DVD) aren't squeezed by the final `setsar=1`.
     /// When any clip has audio, clips without it get silence so the streams line up.
     public static func join(inputs: [JoinInput], output: URL, width: Int, height: Int, fps: Double,
                             encoding: VideoToolEncoding = .mp4) -> [String] {
@@ -112,7 +129,8 @@ public enum VideoToolArgs {
         var graph: [String] = []
         var concatInputs = ""
         for (i, input) in inputs.enumerated() {
-            graph.append("[\(i):v:0]scale=\(width):\(height):force_original_aspect_ratio=decrease:force_divisible_by=2,"
+            graph.append("[\(i):v:0]scale='trunc(iw*sar/2)*2':ih,setsar=1,"
+                         + "scale=\(width):\(height):force_original_aspect_ratio=decrease:force_divisible_by=2,"
                          + "pad=\(width):\(height):(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,"
                          + "fps=\(number(fps)),format=yuv420p,setpts=PTS-STARTPTS[v\(i)]")
             concatInputs += "[v\(i)]"
@@ -184,10 +202,12 @@ public enum VideoToolArgs {
 
     // MARK: Crop
 
-    public static func crop(input: URL, output: URL, rect: VideoCropRect, encoding: VideoToolEncoding) -> [String] {
+    /// `audioCodec`: the source's audio codec, which decides whether the audio can be copied.
+    public static func crop(input: URL, output: URL, rect: VideoCropRect, encoding: VideoToolEncoding,
+                            audioCodec: String? = nil) -> [String] {
         ["-i", input.path, "-map", "0:v:0", "-map", "0:a?",
          "-filter:v", "crop=\(rect.width):\(rect.height):\(rect.x):\(rect.y)"]
-            + encoding.videoArgs + ["-c:a", "copy"] + encoding.muxArgs + [output.path]
+            + encoding.videoArgs + encoding.audioArgs(keeping: input, codec: audioCodec) + encoding.muxArgs + [output.path]
     }
 
     // MARK: Frames
@@ -221,10 +241,13 @@ public enum VideoToolArgs {
     // MARK: Redact
 
     /// Filter graph from `[0:v:0]` to `[vout]` hiding every box during its time range.
+    /// `between` covers frames *starting* inside the range, so a box's `start` must already be a cut
+    /// before the first frame to hide (`VideoFrameTimes.cut`, as `VideoToolOps.redact` does). The
+    /// end gets a microsecond of slack so six-decimal rounding can't drop a frame starting exactly there.
     public static func redactFilterGraph(boxes: [VideoRedactBox], style: VideoRedactStyle, duration: Double) -> String {
         func enable(_ box: VideoRedactBox) -> String? {
             let whole = box.start <= 0.0005 && box.end >= duration - 0.0005
-            return whole ? nil : "enable='between(t,\(number(max(0, box.start))),\(number(box.end)))'"
+            return whole ? nil : "enable='between(t,\(number(max(0, box.start))),\(number(box.end + 0.000001)))'"
         }
         var graph: [String] = []
         var current = "[0:v:0]"
@@ -262,8 +285,9 @@ public enum VideoToolArgs {
     }
 
     public static func redact(input: URL, output: URL, boxes: [VideoRedactBox], style: VideoRedactStyle,
-                              duration: Double, encoding: VideoToolEncoding) -> [String] {
+                              duration: Double, encoding: VideoToolEncoding, audioCodec: String? = nil) -> [String] {
         ["-i", input.path, "-filter_complex", redactFilterGraph(boxes: boxes, style: style, duration: duration),
-         "-map", "[vout]", "-map", "0:a?"] + encoding.videoArgs + ["-c:a", "copy"] + encoding.muxArgs + [output.path]
+         "-map", "[vout]", "-map", "0:a?"] + encoding.videoArgs + encoding.audioArgs(keeping: input, codec: audioCodec)
+            + encoding.muxArgs + [output.path]
     }
 }

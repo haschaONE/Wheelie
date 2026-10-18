@@ -154,7 +154,16 @@ public enum VideoCropMath {
     public static let insideMessage = "Keep the crop inside the video frame."
     public static let tooSmallMessage = "The crop must be at least 2 × 2 pixels."
 
-    /// The biggest centred rectangle of `ratio` (nil = whole frame), with even sides.
+    /// The ratio presets describe the displayed shape. Every function here works in stored pixels,
+    /// so convert first: with non-square pixels (`VideoToolInfo.displayPixelAspect`, e.g. 4/3 for
+    /// HDV), a 1:1 picture is 3 pixels wide for every 4 tall.
+    public static func pixelRatio(_ displayRatio: Double?, pixelAspect: Double) -> Double? {
+        guard let displayRatio, displayRatio > 0, displayRatio.isFinite else { return nil }
+        let aspect = pixelAspect > 0 && pixelAspect.isFinite ? pixelAspect : 1
+        return displayRatio / aspect
+    }
+
+    /// The biggest centred rectangle of `ratio` (width / height in pixels, nil = whole frame), with even sides.
     public static func largest(ratio: Double?, width: Int, height: Int) -> VideoCropRect {
         var w = Double(width), h = Double(height)
         if let ratio, ratio > 0 {

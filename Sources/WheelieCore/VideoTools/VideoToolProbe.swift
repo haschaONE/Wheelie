@@ -18,10 +18,12 @@ public struct VideoToolInfo: Sendable, Equatable {
     public var audioSampleRate: Int?
     /// Pixel aspect ratio of the stored frame (1 for square pixels).
     public var sampleAspectRatio: Double
+    /// The container's first timestamp; ffmpeg and AVPlayer count time from here.
+    public var startTime: Double
 
     public init(duration: Double, width: Int, height: Int, rotation: Int = 0, fps: Double,
                 hasVideo: Bool = true, hasAudio: Bool, videoCodec: String? = nil, audioCodec: String? = nil,
-                audioSampleRate: Int? = nil, sampleAspectRatio: Double = 1) {
+                audioSampleRate: Int? = nil, sampleAspectRatio: Double = 1, startTime: Double = 0) {
         self.duration = duration
         self.width = width
         self.height = height
@@ -33,6 +35,7 @@ public struct VideoToolInfo: Sendable, Equatable {
         self.audioCodec = audioCodec
         self.audioSampleRate = audioSampleRate
         self.sampleAspectRatio = sampleAspectRatio
+        self.startTime = startTime
     }
 
     var isQuarterTurn: Bool { rotation == 90 || rotation == 270 }
@@ -49,20 +52,51 @@ public struct VideoToolInfo: Sendable, Equatable {
                              : Double(displayWidth) * sar / Double(displayHeight)
     }
 
+    /// Horizontal stretch of one displayed pixel: the sample aspect ratio, inverted for a quarter
+    /// turn (the rotation moves the stored horizontal axis to the vertical one).
+    public var displayPixelAspect: Double {
+        let sar = sampleAspectRatio > 0 && sampleAspectRatio.isFinite ? sampleAspectRatio : 1
+        return isQuarterTurn ? 1 / sar : sar
+    }
+
     /// Length of one frame in seconds (1/30 when the rate is unknown).
     public var frameDuration: Double { fps > 0 ? 1 / fps : 1.0 / 30 }
 }
 
 public enum VideoToolProbe {
-    /// Runs `ffprobe -show_streams -show_format -of json`.
+    /// Runs `ffprobe -show_streams -show_format -of json`. When the container records no duration
+    /// (browser MediaRecorder WebM, an unfinished recording), it is measured from the packets.
     public static func probe(_ url: URL) async throws -> VideoToolInfo {
         let (stdout, _) = try await Tools.capture("ffprobe", ["-v", "error", "-show_streams", "-show_format",
                                                               "-of", "json", url.path])
+        var info: VideoToolInfo
         do {
-            return try parse(Data(stdout.utf8))
+            info = try parse(Data(stdout.utf8))
         } catch {
             throw VideoToolError("Couldn't read \(url.lastPathComponent).")
         }
+        if info.hasVideo, info.duration <= 0,
+           let (packets, _) = try? await Tools.capture("ffprobe", ["-v", "error", "-show_entries",
+                                                                    "packet=pts_time,duration_time",
+                                                                    "-of", "csv=p=0", url.path]) {
+            info.duration = measuredDuration(packets, startTime: info.startTime) ?? 0
+        }
+        return info
+    }
+
+    /// End of the last packet in `pts_time,duration_time` lines, counted from `startTime`.
+    public static func measuredDuration(_ csv: String, startTime: Double) -> Double? {
+        var end: Double?
+        for line in csv.split(whereSeparator: \.isNewline) {
+            let fields = line.split(separator: ",", omittingEmptySubsequences: false)
+            guard let pts = fields.first.flatMap({ Double($0) }), pts.isFinite else { continue }
+            var length = fields.count > 1 ? Double(fields[1]) ?? 0 : 0
+            if !(length.isFinite && length > 0) { length = 0 }
+            end = max(end ?? -.infinity, pts + length)
+        }
+        guard let end else { return nil }
+        let duration = end - startTime
+        return duration > 0 && duration <= VideoToolTimecode.maximumSeconds ? duration : nil
     }
 
     /// Parses ffprobe's JSON. Attached cover art does not count as video.
@@ -80,13 +114,16 @@ public enum VideoToolProbe {
         }
         let audio = streams.first { $0["codec_type"] as? String == "audio" }
 
-        var duration = double(format["duration"]) ?? 0
+        var duration = seconds(format["duration"]) ?? 0
         if duration <= 0 {
-            duration = streams.compactMap { double($0["duration"]) ?? tagDuration($0) }.max() ?? 0
+            duration = streams.compactMap { seconds($0["duration"]) ?? tagDuration($0) }.max() ?? 0
         }
 
         var info = VideoToolInfo(duration: max(0, duration), width: 0, height: 0, fps: 0,
                                   hasVideo: video != nil, hasAudio: audio != nil)
+        if let start = double(format["start_time"]), abs(start) <= VideoToolTimecode.maximumSeconds {
+            info.startTime = start
+        }
         if let video {
             info.width = video["width"] as? Int ?? 0
             info.height = video["height"] as? Int ?? 0
@@ -116,9 +153,15 @@ public enum VideoToolProbe {
         if degrees == nil, let tags = stream["tags"] as? [String: Any], let r = double(tags["rotate"]) {
             degrees = r
         }
-        guard let degrees else { return 0 }
+        // A crafted angle like 1e300 would trap converting to Int.
+        guard let degrees, abs(degrees) <= 3600 else { return 0 }
         let quarter = Int((degrees / 90).rounded()) * 90
         return ((quarter % 360) + 360) % 360
+    }
+
+    /// A duration in seconds; absurd values (corrupt or crafted files) count as missing.
+    static func seconds(_ value: Any?) -> Double? {
+        double(value).flatMap { $0 > 0 && $0 <= VideoToolTimecode.maximumSeconds ? $0 : nil }
     }
 
     static func double(_ value: Any?) -> Double? {
@@ -139,29 +182,58 @@ public enum VideoToolProbe {
     static func tagDuration(_ stream: [String: Any]) -> Double? {
         guard let tags = stream["tags"] as? [String: Any] else { return nil }
         let text = (tags["DURATION"] ?? tags["duration"]) as? String
-        return text.flatMap(VideoToolTimecode.parse)
+        return seconds(text.flatMap(VideoToolTimecode.parse))
     }
 
-    // MARK: Keyframes
+    // MARK: Frame times
 
-    /// Presentation times of video keyframes, read from packet flags (no decoding).
-    /// With `near`, only a few seconds around that time are read, which is quick on long files.
-    public static func keyframeTimes(_ url: URL, near time: Double? = nil) async throws -> [Double] {
-        var args = ["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0"]
+    /// Start times of the video frames and keyframes around `time` (or in the whole file), read
+    /// from packets without decoding and counted from the container's start time, as `-ss` counts.
+    /// `startTime` is the file's `VideoToolInfo.startTime` (read_intervals take absolute timestamps).
+    /// `frameDuration` nil = estimated from the frames.
+    public static func frameTimes(_ url: URL, near time: Double? = nil, startTime: Double = 0,
+                                  frameDuration: Double? = nil) async throws -> VideoFrameTimes {
+        var args = ["-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "packet=pts_time,flags:format=start_time", "-of", "json"]
         if let time {
-            args += ["-read_intervals", "\(VideoToolArgs.number(max(0, time - 3)))%+6"]
+            // Reading starts at the keyframe before the window, so every frame up to `time` is
+            // listed. The end is absolute: "+6" would count from that keyframe, which can be far
+            // earlier on long GOPs (or at 0 in files without an index).
+            let from = startTime + max(0, time - 3), to = startTime + time + 3
+            args += ["-read_intervals", "\(VideoToolArgs.number(from))%\(VideoToolArgs.number(to))"]
         }
         let (stdout, _) = try await Tools.capture("ffprobe", args + [url.path])
-        return parseKeyframes(stdout)
+        return try parseFrameTimes(Data(stdout.utf8), frameDuration: frameDuration)
     }
 
-    /// Lines look like `1.000000,K__`; returns the sorted keyframe times.
-    public static func parseKeyframes(_ csv: String) -> [Double] {
-        csv.split(whereSeparator: \.isNewline).compactMap { line -> Double? in
-            let fields = line.split(separator: ",")
-            guard fields.count >= 2, fields[1].hasPrefix("K"), let t = Double(fields[0]) else { return nil }
-            return t
-        }.sorted()
+    /// Parses `-show_entries packet=pts_time,flags:format=start_time -of json`.
+    public static func parseFrameTimes(_ data: Data, frameDuration: Double? = nil) throws -> VideoFrameTimes {
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw VideoToolError("Unexpected ffprobe output.")
+        }
+        let format = root["format"] as? [String: Any] ?? [:]
+        var origin = double(format["start_time"]) ?? 0
+        if abs(origin) > VideoToolTimecode.maximumSeconds { origin = 0 }
+        var starts = Set<Double>(), keys = Set<Double>()
+        for packet in root["packets"] as? [[String: Any]] ?? [] {
+            guard let pts = double(packet["pts_time"]) else { continue }
+            let t = pts - origin
+            starts.insert(t)
+            if (packet["flags"] as? String)?.hasPrefix("K") == true { keys.insert(t) }
+        }
+        let sorted = starts.sorted()
+        var fd = frameDuration ?? 0
+        if !(fd > 0) {
+            let gaps = zip(sorted, sorted.dropFirst()).map { $1 - $0 }.filter { $0 > 1e-6 }.sorted()
+            fd = gaps.isEmpty ? 1.0 / 30 : gaps[gaps.count / 2]
+        }
+        return VideoFrameTimes(starts: sorted, keyframes: keys.sorted(), frameDuration: fd)
+    }
+
+    /// Keyframe start times, counted from the container's start time.
+    /// With `near`, only a few seconds around that time are read, which is quick on long files.
+    public static func keyframeTimes(_ url: URL, near time: Double? = nil, startTime: Double = 0) async throws -> [Double] {
+        try await frameTimes(url, near: time, startTime: startTime).keyframes
     }
 }
 
@@ -175,4 +247,5 @@ public struct VideoToolError: LocalizedError, Equatable, Sendable {
     public static let noAudioTrack = VideoToolError("This file has no audio track.")
     public static let invalidRange = VideoToolError("Set a start and end within the file.")
     public static let noFrame = VideoToolError("No frame is available at this time. Choose an earlier frame.")
+    public static let unknownDuration = VideoToolError("Couldn't tell how long this video is. The file may be damaged or incomplete.")
 }

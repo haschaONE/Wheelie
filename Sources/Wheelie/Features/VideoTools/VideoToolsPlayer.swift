@@ -45,6 +45,8 @@ final class VideoToolsPlayer: ObservableObject {
     private var stillTask: Task<Void, Never>?
     private var thumbnailTask: Task<Void, Never>?
     private var didLoad = false
+    /// Set by `tearDown()`: a load still in flight must not start a player or ffmpeg work afterwards.
+    private var isTornDown = false
     let thumbnailCount = 14
 
     init(url: URL) { self.url = url }
@@ -64,15 +66,28 @@ final class VideoToolsPlayer: ObservableObject {
     // MARK: Loading
 
     func load() async {
-        guard !didLoad else { return }
+        guard !didLoad, !isTornDown else { return }
         didLoad = true
         async let probed = try? VideoToolProbe.probe(url)
         let avInfo = await loadAVFoundation()
         var info = await probed
+        // The window may have closed while the file was being read: release anything
+        // loadAVFoundation set up, and start no stills or thumbnails.
+        if isTornDown {
+            tearDown()
+            return
+        }
         if info == nil, let avInfo { info = avInfo }
         guard let info, info.hasVideo, info.duration > 0 else {
-            state = .failed(info == nil ? "Couldn't read this video. Is ffmpeg installed? (brew install ffmpeg)"
-                                        : VideoToolError.noVideoTrack.message)
+            let message: String
+            if info == nil {
+                message = "Couldn't read this video. Is ffmpeg installed? (brew install ffmpeg)"
+            } else if info?.hasVideo == false {
+                message = VideoToolError.noVideoTrack.message
+            } else {
+                message = VideoToolError.unknownDuration.message
+            }
+            state = .failed(message)
             return
         }
         self.info = info
@@ -91,6 +106,7 @@ final class VideoToolsPlayer: ObservableObject {
               let (size, transform, fps) = try? await track.load(.naturalSize, .preferredTransform, .nominalFrameRate)
         else { return nil }
         let audio = (try? await asset.loadTracks(withMediaType: .audio)) ?? []
+        guard !isTornDown else { return nil }
         self.asset = asset
         let item = AVPlayerItem(asset: asset)
         item.audioTimePitchAlgorithm = keepPitch ? .spectral : .varispeed
@@ -114,6 +130,7 @@ final class VideoToolsPlayer: ObservableObject {
 
     /// Stops playback and releases the player; called when the editor window closes.
     func tearDown() {
+        isTornDown = true
         player?.pause()
         isPlaying = false
         if let timeObserver { player?.removeTimeObserver(timeObserver) }
@@ -207,7 +224,7 @@ final class VideoToolsPlayer: ObservableObject {
         guard let player else { return }
         if seekInFlight { pendingSeek = t; return }
         seekInFlight = true
-        player.seek(to: CMTime(seconds: t, preferredTimescale: 6000), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+        player.seek(to: Self.exactTime(t), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 self.seekInFlight = false
@@ -219,16 +236,25 @@ final class VideoToolsPlayer: ObservableObject {
         }
     }
 
+    /// The playhead as a CMTime for zero-tolerance seeks. AVFoundation shows the last frame starting
+    /// at or before it, like the exports (`VideoFrameTimes`). A coarse timescale would round a frame
+    /// start such as 1001/30000 s down and show the frame before, so use nanoseconds plus the same
+    /// tolerance the exports allow.
+    static func exactTime(_ seconds: Double) -> CMTime {
+        CMTime(seconds: max(0, seconds) + VideoFrameTimes.tolerance, preferredTimescale: 1_000_000_000)
+    }
+
     // MARK: Frames
 
     private func requestStill(at time: Double) {
-        guard !canPlay else { return }
+        guard !canPlay, !isTornDown else { return }
         stillTask?.cancel()
-        let url = url, duration = duration
+        let url = url, duration = duration, startTime = info?.startTime ?? 0
         stillTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 90_000_000)
             guard !Task.isCancelled else { return }
-            let image = try? await VideoToolFrames.frame(url, at: time, maxHeight: 720, duration: duration)
+            let image = try? await VideoToolFrames.frame(url, at: time, maxHeight: 720, duration: duration,
+                                                         startTime: startTime)
             guard !Task.isCancelled, let image else { return }
             self?.stillFrame = image
         }
@@ -242,19 +268,22 @@ final class VideoToolsPlayer: ObservableObject {
             generator.maximumSize = CGSize(width: maxHeight * 3, height: maxHeight)
             generator.requestedTimeToleranceBefore = .zero
             generator.requestedTimeToleranceAfter = .zero
-            if let image = try? await generator.image(at: CMTime(seconds: time, preferredTimescale: 6000)).image {
+            if let image = try? await generator.image(at: Self.exactTime(time)).image {
                 return image
             }
         }
-        return try? await VideoToolFrames.frame(url, at: time, maxHeight: maxHeight, duration: duration)
+        return try? await VideoToolFrames.frame(url, at: time, maxHeight: maxHeight, duration: duration,
+                                                startTime: info?.startTime ?? 0)
     }
 
     private func startThumbnails() {
+        guard !isTornDown else { return }
         let count = thumbnailCount
         thumbnails = Array(repeating: nil, count: count)
         let url = url, duration = duration
         let times = (0..<count).map { (Double($0) + 0.5) * duration / Double(count) }
         let asset = canPlay ? asset : nil
+        // Stops when cancelled (tearDown) or when the player is gone.
         thumbnailTask = Task { [weak self] in
             if let asset {
                 let generator = AVAssetImageGenerator(asset: asset)
@@ -264,15 +293,19 @@ final class VideoToolsPlayer: ObservableObject {
                 generator.requestedTimeToleranceBefore = tolerance
                 generator.requestedTimeToleranceAfter = tolerance
                 for (index, t) in times.enumerated() {
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled, self != nil else { return }
                     let image = try? await generator.image(at: CMTime(seconds: t, preferredTimescale: 600)).image
-                    self?.thumbnails[index] = image
+                    guard !Task.isCancelled, let self else { return }
+                    self.thumbnails[index] = image
                 }
             } else {
                 for (index, t) in times.enumerated() {
-                    guard !Task.isCancelled else { return }
-                    let image = try? await VideoToolFrames.frame(url, at: t, maxHeight: 120, duration: duration)
-                    self?.thumbnails[index] = image
+                    guard !Task.isCancelled, self != nil else { return }
+                    // The filmstrip doesn't need the exact frame: skip the packet scan.
+                    let image = try? await VideoToolFrames.frame(url, at: t, maxHeight: 120, duration: duration,
+                                                                 exact: false)
+                    guard !Task.isCancelled, let self else { return }
+                    self.thumbnails[index] = image
                 }
             }
         }
