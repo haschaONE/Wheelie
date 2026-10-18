@@ -58,6 +58,11 @@ enum AudioTool: String, CaseIterable {
 
 /// Outer-ring audio tools: Trim, Channels, Normalize, Bleep, Visualizer. Each opens an editor window.
 enum AudioToolsFeature: WheelieFeature {
+    /// Editors delete their temp folder when they close; one still open when the app quit leaves it behind.
+    static func start() {
+        TempWorkspace.removeLeftovers(createdBefore: Date())
+    }
+
     static func wheelItems() -> [WheelItem] {
         AudioTool.allCases.enumerated().map { index, tool in
             WheelItem(id: tool.id, label: tool.label, symbol: tool.symbol, ring: .outer, order: 300 + index,

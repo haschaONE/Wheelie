@@ -115,13 +115,31 @@ final class VisualizerEditorModel: AudioEditorModel {
         }
     }
 
+    /// Decoding and re-encoding a big photo takes a while, so it runs off the main thread.
     private func useImage(_ url: URL) {
-        do {
-            customImage = try AudioVisualizer.preparedImage(url, into: temp.directory)
-            customImageName = url.lastPathComponent
-            if backdrop == .image { refresh(delay: 0) } else { backdrop = .image }
-        } catch {
-            self.error = error.localizedDescription
+        let directory = temp.directory
+        tasks["image"]?.cancel()
+        isRenderingPreview = true
+        tasks["image"] = Task { [weak self] in
+            let result = await Task.detached(priority: .userInitiated) {
+                Result { try AudioVisualizer.preparedImage(url, into: directory) }
+            }.value
+            guard let self else { return }
+            guard !Task.isCancelled else {
+                if case .success(let prepared) = result { try? FileManager.default.removeItem(at: prepared) }
+                return
+            }
+            self.isRenderingPreview = false
+            switch result {
+            case .success(let prepared):
+                // The previous image stays in the temp folder: an export may still be reading it.
+                self.customImage = prepared
+                self.customImageName = url.lastPathComponent
+                self.error = nil
+                if self.backdrop == .image { self.refresh(delay: 0) } else { self.backdrop = .image }
+            case .failure(let failure):
+                self.error = failure.localizedDescription
+            }
         }
     }
 

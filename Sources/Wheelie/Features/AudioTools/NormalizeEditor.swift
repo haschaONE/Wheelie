@@ -101,6 +101,7 @@ final class NormalizeEditorModel: AudioEditorModel {
             return
         }
         if let previewURL, previewTarget == target {
+            tasks["preview"]?.cancel()          // a render for another target must not replace it
             player.use(previewURL)
             if thenPlay { player.play() }
             return
@@ -115,7 +116,11 @@ final class NormalizeEditorModel: AudioEditorModel {
                 try await AudioNormalize.normalize(url, target: target, info: info, measurement: measurement,
                                                    output: output, encoding: .preview(forDuration: info.duration),
                                                    keepVideo: false)
-                guard !Task.isCancelled else { return }
+                // Replaced, or the target changed meanwhile: this render is for a target no longer shown.
+                guard !Task.isCancelled, self.target == target else {
+                    try? FileManager.default.removeItem(at: output)
+                    return
+                }
                 let old = self.previewURL
                 self.previewURL = output
                 self.previewTarget = target
@@ -245,7 +250,7 @@ struct NormalizeEditorView: View {
             }
             if model.info?.hasVideo == true {
                 SettingRow(title: "") {
-                    Text("The video is copied unchanged; only the audio track is normalized.")
+                    Text(model.videoNote("normalized"))
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }

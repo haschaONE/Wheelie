@@ -83,10 +83,8 @@ public enum AudioTrim {
         var args = AudioFFmpeg.baseArguments
         if settings.start > 0 { args += ["-ss", AudioFFmpeg.num(settings.start)] }
         args += ["-t", AudioFFmpeg.num(settings.duration), "-i", input.path]
-        args += AudioFFmpeg.streamMaps(info, encoding: encoding, keepVideo: false)
-        if let fades = fadeFilter(settings) { args += ["-af", fades] }
-        args += encoding.codecArguments
-        if let rate = encoding.requiredSampleRate { args += ["-ar", "\(rate)"] }
+        args += AudioFFmpeg.audioArguments(info, encoding: encoding, keepVideo: false, filter: fadeFilter(settings),
+                                           sampleRate: encoding.requiredSampleRate)
         args.append(output.path)
         return args
     }

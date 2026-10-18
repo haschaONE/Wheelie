@@ -14,8 +14,17 @@ final class BleepEditorModel: AudioEditorModel {
 
     private var previewURL: URL?
     private var previewKey: String?
+    /// The range "Bleep Entire Audio" made. While it still ends at the end of the previewed file, it runs to
+    /// the end of every selected file, however long each one is.
+    private var wholeFileRange: UUID?
 
-    var settings: BleepSettings { BleepSettings(ranges: ranges, style: style, volume: volume) }
+    var settings: BleepSettings {
+        let open = ranges.map { range -> BleepRange in
+            guard range.id == wholeFileRange, range.end >= primaryDuration else { return range }
+            return BleepRange(id: range.id, start: range.start, end: .infinity)
+        }
+        return BleepSettings(ranges: open, style: style, volume: volume)
+    }
     override var canExport: Bool { super.canExport && !ranges.isEmpty }
     var selected: BleepRange? { ranges.first { $0.id == selection } }
     var sortedRanges: [BleepRange] { ranges.sorted { $0.start < $1.start } }
@@ -39,8 +48,10 @@ final class BleepEditorModel: AudioEditorModel {
     }
 
     func bleepEntireAudio() {
-        ranges = [BleepRange(start: 0, end: primaryDuration)]
-        selection = ranges.first?.id
+        let range = BleepRange(start: 0, end: primaryDuration)
+        wholeFileRange = range.id
+        ranges = [range]
+        selection = range.id
     }
 
     func setStart(_ id: UUID, _ value: Double) {
@@ -77,7 +88,7 @@ final class BleepEditorModel: AudioEditorModel {
     // MARK: Preview
 
     private var key: String {
-        let merged = AudioBleep.merged(ranges, duration: primaryDuration)
+        let merged = AudioBleep.merged(settings.ranges, duration: primaryDuration)
         return "\(style.rawValue)-\(volume)-" + merged.map { "\($0.lowerBound)-\($0.upperBound)" }.joined(separator: ",")
     }
 
@@ -100,6 +111,7 @@ final class BleepEditorModel: AudioEditorModel {
         if !hearBleeps || ranges.isEmpty {
             player.use(primary)
         } else if let previewURL, previewKey == key {
+            tasks["preview"]?.cancel()          // a render for other settings must not replace it
             player.use(previewURL)
         } else if player.isPlaying {
             renderPreview(thenPlay: false, delay: 0)
@@ -108,7 +120,11 @@ final class BleepEditorModel: AudioEditorModel {
 
     private func settingsChanged() {
         guard info != nil else { return }
-        if ranges.isEmpty { player.use(primary); return }
+        if ranges.isEmpty {
+            tasks["preview"]?.cancel()
+            player.use(primary)
+            return
+        }
         guard hearBleeps, player.isPlaying, player.source != primary else { return }
         renderPreview(thenPlay: false, delay: 0.4)
     }
@@ -124,7 +140,16 @@ final class BleepEditorModel: AudioEditorModel {
             do {
                 try await AudioBleep.bleep(url, settings: settings, info: info, output: output,
                                            encoding: .preview(forDuration: info.duration))
-                guard !Task.isCancelled else { return }
+                guard !Task.isCancelled else {
+                    try? FileManager.default.removeItem(at: output)
+                    return
+                }
+                // The bleeps changed meanwhile: this render is for settings no longer shown.
+                guard self.key == key else {
+                    try? FileManager.default.removeItem(at: output)
+                    if thenPlay, self.hearBleeps, !self.ranges.isEmpty { self.renderPreview(thenPlay: true, delay: 0) }
+                    return
+                }
                 let old = self.previewURL
                 self.previewURL = output
                 self.previewKey = key

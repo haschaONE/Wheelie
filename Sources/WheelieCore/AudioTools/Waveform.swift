@@ -62,24 +62,31 @@ public enum WaveformExtractor {
             throw AudioToolError.unreadable("Could not read the audio waveform.")
         }
         let duration = info.duration
+        // Buckets are laid out by time over `duration`, so the peaks line up with the timeline even when
+        // the decoded audio is a little shorter or longer than the probed length.
+        let span = duration > 0 ? Int((duration * Double(rate)).rounded()) : nil
         return try await Task.detached(priority: .userInitiated) {
             let data = try Data(contentsOf: raw, options: .alwaysMapped)
             let peaks = data.withUnsafeBytes { bytes -> [[Float]] in
                 let samples = bytes.bindMemory(to: Int16.self)
-                return Self.peaks(int16: samples, channels: outChannels, buckets: count)
+                return Self.peaks(int16: samples, channels: outChannels, buckets: count, spanFrames: span)
             }
             return Waveform(channels: peaks, duration: duration)
         }.value
     }
 
-    /// Interleaved 16-bit samples -> `buckets` absolute peaks per channel.
-    public static func peaks(int16 samples: UnsafeBufferPointer<Int16>, channels: Int, buckets: Int) -> [[Float]] {
+    /// Interleaved 16-bit samples -> `buckets` absolute peaks per channel. The buckets divide `spanFrames`
+    /// frames (default: all of them); buckets past the end of the samples stay 0, samples past the span are left out.
+    public static func peaks(int16 samples: UnsafeBufferPointer<Int16>, channels: Int, buckets: Int,
+                             spanFrames: Int? = nil) -> [[Float]] {
         let frames = samples.count / max(channels, 1)
         guard frames > 0, buckets > 0 else { return Array(repeating: Array(repeating: 0, count: max(buckets, 0)), count: max(channels, 1)) }
+        let span = max(1, spanFrames ?? frames)
         var result = Array(repeating: [Float](repeating: 0, count: buckets), count: channels)
         for bucket in 0..<buckets {
-            let lower = frames * bucket / buckets
-            var upper = frames * (bucket + 1) / buckets
+            let lower = span * bucket / buckets
+            guard lower < frames else { break }
+            var upper = min(span * (bucket + 1) / buckets, frames)
             if upper <= lower { upper = min(lower + 1, frames) }
             for channel in 0..<channels {
                 var peak: Int32 = 0
