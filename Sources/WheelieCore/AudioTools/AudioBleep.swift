@@ -21,6 +21,7 @@ public enum BleepStyle: String, CaseIterable, Sendable, Identifiable {
 }
 
 public struct BleepSettings: Sendable, Equatable {
+    /// Times in seconds. An `end` of `.infinity` means "to the end of each file".
     public var ranges: [BleepRange]
     public var style: BleepStyle
     /// Tone amplitude, 0...1 of full scale.
@@ -39,6 +40,7 @@ public enum AudioBleep {
     public static let minimumRange = 0.02
 
     /// Sorted, clamped to the file, overlapping or touching ranges merged, tiny ones dropped.
+    /// An infinite end is clamped to `duration` (or stays infinite when the duration is unknown).
     public static func merged(_ ranges: [BleepRange], duration: Double) -> [ClosedRange<Double>] {
         let clamped = ranges.compactMap { r -> ClosedRange<Double>? in
             let a = max(0, r.start), b = duration > 0 ? min(duration, r.end) : r.end
@@ -55,33 +57,40 @@ public enum AudioBleep {
         return result
     }
 
-    /// "between(t,1.5,2)+between(t,4,4.25)" — non-zero inside any range.
-    public static func enableExpression(_ ranges: [ClosedRange<Double>]) -> String {
-        ranges.map { "between(t,\(AudioFFmpeg.num($0.lowerBound)),\(AudioFFmpeg.num($0.upperBound)))" }
-            .joined(separator: "+")
+    /// Per-sample test for "t is inside a bleep range", as a balanced tree of `if`s so each sample costs
+    /// O(log n) comparisons. `ranges` must be sorted and disjoint (see `merged`). A range that reaches
+    /// `duration` stays on to the real end of the audio, which can run a little past the probed duration.
+    /// Evaluates to 1 inside a range and 0 outside.
+    public static func insideExpression(_ ranges: [ClosedRange<Double>], duration: Double) -> String {
+        func node(_ lower: Int, _ upper: Int) -> String {
+            guard lower < upper else { return "0" }
+            let mid = (lower + upper) / 2
+            let range = ranges[mid]
+            let toEnd = !range.upperBound.isFinite || (duration > 0 && range.upperBound >= duration)
+            let inside = toEnd ? "1" : "if(lte(t,\(AudioFFmpeg.num(range.upperBound))),1,\(node(mid + 1, upper)))"
+            return "if(lt(t,\(AudioFFmpeg.num(range.lowerBound))),\(node(lower, mid)),\(inside))"
+        }
+        return node(0, ranges.count)
     }
 
     /// Filter graph from input 0's audio to [bleeped].
-    /// Muting: `volume=0` enabled inside the ranges. Beep: a sine tone gated to the same ranges, mixed back in.
+    /// Every sample inside a range is replaced: by silence, or by a sine tone at the chosen level. `aeval`
+    /// works per sample, so a range starts and ends exactly where it was set, whatever the decoder's frame
+    /// size (timeline `enable=` options are only checked once per frame, which let the start of a word
+    /// through, or a short range be skipped entirely).
     public static func filterGraph(settings: BleepSettings, info: AudioInfo) throws -> String {
         let ranges = merged(settings.ranges, duration: info.duration)
         guard !ranges.isEmpty else { throw AudioToolError.invalidSettings("Add at least one bleep range.") }
-        let expr = enableExpression(ranges)
-        let source = "[0:\(info.audioStreamIndex)]asetpts=PTS-STARTPTS,volume=0:enable='\(expr)'"
-        guard settings.style == .beep, settings.volume > 0 else { return source + "[bleeped]" }
-
-        // sine's amplitude is 1/8 of full scale.
-        let gain = min(1, max(0, settings.volume)) * 8
-        let duration = max(info.duration, ranges.last!.upperBound) + 0.1
-        var tone = "sine=frequency=\(AudioFFmpeg.num(settings.frequency)):sample_rate=\(info.sampleRate)"
-            + ":duration=\(AudioFFmpeg.num(duration))"
-            + ",volume=\(AudioFFmpeg.num(gain)),volume=0:enable='not(\(expr))'"
-        if info.channels > 1 {
-            let layout = info.channelLayout ?? "\(info.channels)c"
-            tone += ",pan=\(layout)|" + (0..<info.channels).map { "c\($0)=c0" }.joined(separator: "|")
+        let inside = insideExpression(ranges, duration: info.duration)
+        let replacement: String
+        if settings.style == .beep, settings.volume > 0 {
+            let amplitude = min(1, max(0, settings.volume))
+            replacement = "\(AudioFFmpeg.num(amplitude))*sin(2*PI*\(AudioFFmpeg.num(settings.frequency))*t)"
+        } else {
+            replacement = "0"
         }
-        return source + "[muted];" + tone + "[tone];"
-            + "[muted][tone]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[bleeped]"
+        return "[0:\(info.audioStreamIndex)]asetpts=PTS-STARTPTS,"
+            + "aeval=exprs='if(\(inside),\(replacement),val(ch))':c=same[bleeped]"
     }
 
     public static func arguments(input: URL, output: URL, info: AudioInfo, settings: BleepSettings,

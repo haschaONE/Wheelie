@@ -30,6 +30,8 @@ public struct AudioInfo: Sendable, Equatable {
     public var bitRate: Int?
     /// Absolute stream index of the first audio stream.
     public var audioStreamIndex: Int
+    /// Absolute stream indexes of any further audio streams (other languages, commentary), in file order.
+    public var otherAudioStreamIndices: [Int]
     /// True when the file has a real video stream (not just cover art).
     public var hasVideo: Bool
     /// Absolute stream index of embedded cover art (an attached picture), if any.
@@ -39,9 +41,10 @@ public struct AudioInfo: Sendable, Equatable {
     public var formatName: String
 
     public init(duration: Double, channels: Int, channelLayout: String? = nil, sampleRate: Int, codec: String,
-                bitRate: Int? = nil, audioStreamIndex: Int = 0, hasVideo: Bool = false,
-                coverArtStreamIndex: Int? = nil, videoWidth: Int? = nil, videoHeight: Int? = nil,
-                formatName: String = "") {
+                bitRate: Int? = nil, audioStreamIndex: Int = 0, otherAudioStreamIndices: [Int] = [],
+                hasVideo: Bool = false, coverArtStreamIndex: Int? = nil, videoWidth: Int? = nil,
+                videoHeight: Int? = nil, formatName: String = "") {
+        self.otherAudioStreamIndices = otherAudioStreamIndices
         self.duration = duration
         self.channels = channels
         self.channelLayout = channelLayout
@@ -102,21 +105,49 @@ public enum AudioProbe {
         return try await probe(url)
     }
 
+    /// What ffmpeg logs when a file has no length in it (raw ADTS AAC, VBR MP3 without a Xing header,
+    /// AC-3, ...) and it guesses one from the bit rate, which for VBR audio can be off by a factor of ten.
+    static let estimatedDurationWarning = "Estimating duration from bitrate"
+
     /// Probes the first audio stream. Throws `AudioToolError.noAudio` when there is none.
+    /// When ffprobe only estimates the duration, the real one is measured by reading every packet.
     public static func probe(_ url: URL) async throws -> AudioInfo {
         let output: (stdout: String, stderr: String)
         do {
-            output = try await Tools.capture("ffprobe", ["-v", "error", "-print_format", "json",
+            output = try await Tools.capture("ffprobe", ["-v", "warning", "-print_format", "json",
                                                          "-show_format", "-show_streams", url.path])
         } catch let error as ToolError {
             if case .missing = error { throw error }
             throw AudioToolError.unreadable("Couldn't read \(url.lastPathComponent).")
         }
-        return try parse(json: Data(output.stdout.utf8), name: url.lastPathComponent)
+        let json = Data(output.stdout.utf8)
+        let info = try parse(json: json, name: url.lastPathComponent)
+        guard output.stderr.contains(estimatedDurationWarning),
+              let measured = await measuredDuration(url, streamIndex: info.audioStreamIndex) else { return info }
+        return try parse(json: json, name: url.lastPathComponent, measuredDuration: measured)
     }
 
-    /// Parses `ffprobe -print_format json -show_format -show_streams` output.
-    public static func parse(json: Data, name: String = "") throws -> AudioInfo {
+    /// The real length of one stream, from the timestamps of all its packets. The stream is read and
+    /// copied to nowhere, not decoded, so this is quick even for long files.
+    static func measuredDuration(_ url: URL, streamIndex: Int) async -> Double? {
+        let args = ["-nostdin", "-hide_banner", "-nostats", "-loglevel", "error", "-i", url.path,
+                    "-map", "0:\(streamIndex)", "-c", "copy", "-f", "null", "-progress", "pipe:1", "-"]
+        guard let output = try? await Tools.capture("ffmpeg", args) else { return nil }
+        return parseProgressDuration(output.stdout)
+    }
+
+    /// The last `out_time_us=` of ffmpeg's `-progress` output, in seconds.
+    static func parseProgressDuration(_ text: String) -> Double? {
+        var last: Double?
+        for line in text.split(whereSeparator: \.isNewline) where line.hasPrefix("out_time_us=") {
+            if let micro = Double(line.dropFirst("out_time_us=".count)), micro > 0 { last = micro / 1_000_000 }
+        }
+        return last
+    }
+
+    /// Parses `ffprobe -print_format json -show_format -show_streams` output. `measuredDuration` replaces
+    /// the file's own duration when that was only an estimate (and the bit rate derived from it).
+    public static func parse(json: Data, name: String = "", measuredDuration: Double? = nil) throws -> AudioInfo {
         guard let root = try? JSONSerialization.jsonObject(with: json) as? [String: Any] else {
             throw AudioToolError.unreadable(name.isEmpty ? "Couldn't read this file." : "Couldn't read \(name).")
         }
@@ -140,10 +171,16 @@ public enum AudioProbe {
         let realVideo = videos.first { !isAttachedPic($0) }
         let art = videos.first { isAttachedPic($0) }
 
+        let audioStreams = streams.filter { $0["codec_type"] as? String == "audio" }
         var duration = number(format["duration"]) ?? number(audio["duration"]) ?? 0
         if duration <= 0, let d = number(audio["duration"]) { duration = d }
-        let audioOnly = realVideo == nil && streams.filter({ $0["codec_type"] as? String == "audio" }).count == 1
+        let audioOnly = realVideo == nil && audioStreams.count == 1
         var bitRate = number(audio["bit_rate"]).map { Int($0) }
+        if let measuredDuration, measuredDuration > 0 {
+            duration = measuredDuration
+            // The estimated duration came from a guessed bit rate; the file size gives the real average.
+            if audioOnly, let size = number(format["size"]), size > 0 { bitRate = Int(size * 8 / measuredDuration) }
+        }
         if bitRate == nil, audioOnly, let formatRate = number(format["bit_rate"]) { bitRate = Int(formatRate) }
         let layout = (audio["channel_layout"] as? String).flatMap { $0.isEmpty || $0 == "unknown" ? nil : $0 }
 
@@ -155,6 +192,7 @@ public enum AudioProbe {
             codec: audio["codec_name"] as? String ?? "unknown",
             bitRate: bitRate,
             audioStreamIndex: audio["index"] as? Int ?? 0,
+            otherAudioStreamIndices: audioStreams.dropFirst().compactMap { $0["index"] as? Int },
             hasVideo: realVideo != nil,
             coverArtStreamIndex: art?["index"] as? Int,
             videoWidth: realVideo?["width"] as? Int,

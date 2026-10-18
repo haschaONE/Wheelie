@@ -18,7 +18,22 @@ final class ChannelsEditorModel: AudioEditorModel {
     @Published var swapped = false { didSet { settingsChanged() } }
     @Published private(set) var preview: Preview = .original
 
-    private var renders: [String: URL] = [:]
+    /// Finished preview renders by settings key, newest last. Each is a full-length file, so only a few are kept.
+    private var renders: [(key: String, url: URL)] = []
+    private static let maximumRenders = 4
+
+    private func cachedRender(_ key: String) -> URL? { renders.last { $0.key == key }?.url }
+
+    /// Adds a render and deletes the oldest ones past the limit (never the one playing).
+    private func storeRender(_ url: URL, for key: String) {
+        renders.append((key, url))
+        while renders.count > Self.maximumRenders,
+              let index = renders.firstIndex(where: { $0.url != player.source }) {
+            let evicted = renders.remove(at: index)
+            player.forget(evicted.url)
+            try? FileManager.default.removeItem(at: evicted.url)
+        }
+    }
 
     override var waveformChannels: Int { 2 }
     override var waveformUnavailableMessage: String { "Channel waveforms unavailable. You can still convert the audio." }
@@ -100,7 +115,8 @@ final class ChannelsEditorModel: AudioEditorModel {
         }
         guard let info else { return }
         let key = renderKey(target)
-        if let url = renders[key] {
+        if let url = cachedRender(key) {
+            tasks["render"]?.cancel()
             player.use(url)
             player.play()
             return
@@ -138,8 +154,13 @@ final class ChannelsEditorModel: AudioEditorModel {
                     try await AudioChannels.convert(url, settings: settings, info: info, output: output,
                                                     encoding: .preview(forDuration: info.duration), keepVideo: false)
                 }
-                guard !Task.isCancelled, self.preview == target else { return }
-                self.renders[key] = output
+                guard !Task.isCancelled else {
+                    try? FileManager.default.removeItem(at: output)
+                    return
+                }
+                self.storeRender(output, for: key)
+                // The settings or the preview changed meanwhile: keep the render for later, but don't play it.
+                guard self.preview == target, self.renderKey(target) == key else { return }
                 let wasPlaying = self.player.isPlaying
                 self.player.use(output)
                 if thenPlay || wasPlaying { self.player.play() }
@@ -156,7 +177,8 @@ final class ChannelsEditorModel: AudioEditorModel {
         // A playing preview follows the new settings; anything else re-renders on the next play.
         guard let info, preview != .original else { return }
         let key = renderKey(preview)
-        if let url = renders[key] {
+        if let url = cachedRender(key) {
+            tasks["render"]?.cancel()           // a render for other settings must not replace it
             player.use(url)
         } else if player.isPlaying {
             render(preview, info: info, key: key, thenPlay: false)
@@ -249,7 +271,7 @@ struct ChannelsEditorView: View {
                     .help(model.swapApplies ? "The left channel plays on the right and vice versa" : "Needs a stereo file and stereo output")
             }
             if model.info?.hasVideo == true {
-                Text("The video is copied unchanged; only the audio track is converted.")
+                Text(model.videoNote("converted"))
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

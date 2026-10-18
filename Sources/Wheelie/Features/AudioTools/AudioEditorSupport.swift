@@ -6,11 +6,27 @@ import WheelieCore
 
 /// A private temp folder for one editor's previews; removed when the editor goes away.
 final class TempWorkspace: Sendable {
+    static let prefix = "Wheelie-audio-"
     let directory: URL
 
     init() {
-        directory = FileManager.default.temporaryDirectory.appendingPathComponent("Wheelie-audio-\(UUID().uuidString)")
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent(Self.prefix + UUID().uuidString)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    /// Deletes editor temp folders left by an earlier run (the app quit with an editor open, or crashed).
+    /// Only folders created before `date`, so an editor opened meanwhile keeps its own.
+    static func removeLeftovers(createdBefore date: Date) {
+        Task.detached(priority: .utility) {
+            let fm = FileManager.default
+            let tmp = fm.temporaryDirectory
+            guard let names = try? fm.contentsOfDirectory(atPath: tmp.path) else { return }
+            for name in names where name.hasPrefix(prefix) {
+                let url = tmp.appendingPathComponent(name)
+                let created = (try? url.resourceValues(forKeys: [.creationDateKey]))?.creationDate ?? .distantFuture
+                if created < date { try? fm.removeItem(at: url) }
+            }
+        }
     }
 
     func url(_ prefix: String, ext: String) -> URL {
@@ -130,6 +146,14 @@ class AudioEditorModel: ObservableObject {
     /// Duration of the previewed file; the timeline and waveform span this.
     var primaryDuration: Double { info?.duration ?? 0 }
     var isMultiFile: Bool { files.count > 1 }
+
+    /// For movies: what happens to the streams that aren't processed.
+    func videoNote(_ verb: String) -> String {
+        let others = info.map { !$0.otherAudioStreamIndices.isEmpty } ?? false
+        return others
+            ? "The video, the other audio tracks and any subtitles are copied unchanged; only the first audio track is \(verb)."
+            : "The video and any subtitles are copied unchanged; only the audio track is \(verb)."
+    }
     var canExport: Bool { info != nil && loadError == nil && !isExporting }
 
     init(tool: AudioTool, files: [URL], windowID: String) {

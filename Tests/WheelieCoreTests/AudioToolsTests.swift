@@ -49,6 +49,34 @@ final class AudioParsingTests: XCTestCase {
         XCTAssertEqual(audio.bitRate, 192000, "falls back to the format bit rate for audio-only files")
         XCTAssertTrue(audio.summary.contains("Mono"))
 
+        // A movie with two audio tracks: the first is processed, the second is listed to be kept.
+        let multi = """
+        {"streams":[{"index":0,"codec_name":"h264","codec_type":"video","width":640,"height":360},
+                    {"index":1,"codec_name":"aac","codec_type":"audio","sample_rate":"48000","channels":2},
+                    {"index":2,"codec_name":"mov_text","codec_type":"subtitle"},
+                    {"index":3,"codec_name":"ac3","codec_type":"audio","sample_rate":"48000","channels":6}],
+         "format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","duration":"5"}}
+        """
+        let multiInfo = try AudioProbe.parse(json: Data(multi.utf8))
+        XCTAssertEqual(multiInfo.audioStreamIndex, 1)
+        XCTAssertEqual(multiInfo.otherAudioStreamIndices, [3])
+        XCTAssertEqual(info.otherAudioStreamIndices, [])
+
+        // Raw VBR AAC: ffprobe guesses 509 s from the bit rate; the measured length replaces it, and the
+        // average bit rate follows from the file size.
+        let adts = """
+        {"streams":[{"index":0,"codec_name":"aac","codec_type":"audio","sample_rate":"44100","channels":2}],
+         "format":{"format_name":"aac","duration":"509.08","size":"640000","bit_rate":"10057"}}
+        """
+        let estimated = try AudioProbe.parse(json: Data(adts.utf8))
+        XCTAssertEqual(estimated.duration, 509.08, accuracy: 0.001)
+        let measured = try AudioProbe.parse(json: Data(adts.utf8), measuredDuration: 40)
+        XCTAssertEqual(measured.duration, 40)
+        XCTAssertEqual(measured.bitRate, 128_000)
+        XCTAssertEqual(AudioProbe.parseProgressDuration("out_time_us=N/A\nprogress=continue\nout_time_us=1500000\nout_time_us=40031202\nprogress=end\n")!,
+                       40.031202, accuracy: 0.000001)
+        XCTAssertNil(AudioProbe.parseProgressDuration("progress=end\n"))
+
         let silentVideo = #"{"streams":[{"index":0,"codec_type":"video","codec_name":"h264"}],"format":{"duration":"2"}}"#
         XCTAssertThrowsError(try AudioProbe.parse(json: Data(silentVideo.utf8), name: "clip.mp4")) { error in
             XCTAssertEqual(error.localizedDescription, "clip.mp4 has no audio track.")
@@ -178,6 +206,15 @@ final class AudioParsingTests: XCTestCase {
         XCTAssertEqual(wave.maximum, 1, accuracy: 0.001)
         // More buckets than samples still yields the requested count.
         XCTAssertEqual(WaveformExtractor.peaks(interleaved: [0.2, 0.4], channels: 1, buckets: 8)[0].count, 8)
+        // Buckets laid out over a longer span than the decoded samples: the peaks stay where they are in
+        // time and the buckets past the end of the audio are empty.
+        let spanned = [Float](repeating: 0.5, count: 100).withUnsafeBufferPointer { floats -> [[Float]] in
+            let ints = floats.map { Int16($0 * 32767) }
+            return ints.withUnsafeBufferPointer { WaveformExtractor.peaks(int16: $0, channels: 1, buckets: 10, spanFrames: 200) }
+        }
+        XCTAssertEqual(spanned[0][4], 0.5, accuracy: 0.001)
+        XCTAssertEqual(spanned[0][5], 0)
+        XCTAssertEqual(spanned[0][9], 0)
         XCTAssertEqual(WaveformExtractor.bucketCount(forDuration: 1), 1000)
         XCTAssertEqual(WaveformExtractor.bucketCount(forDuration: 99_999), 30_000)
     }
@@ -204,17 +241,27 @@ final class AudioParsingTests: XCTestCase {
                       BleepRange(start: 9, end: 12), BleepRange(start: 5, end: 5.001)]
         let merged = AudioBleep.merged(ranges, duration: 10)
         XCTAssertEqual(merged, [1...2.5, 3...4, 9...10])
-        XCTAssertEqual(AudioBleep.enableExpression(merged), "between(t,1,2.5)+between(t,3,4)+between(t,9,10)")
+        // A balanced if-tree, checked per sample; the last range reaches the end, so it stays on to the real end.
+        XCTAssertEqual(AudioBleep.insideExpression(merged, duration: 10),
+                       "if(lt(t,3),if(lt(t,1),0,if(lte(t,2.5),1,0)),if(lte(t,4),1,if(lt(t,9),0,1)))")
+        XCTAssertEqual(AudioBleep.insideExpression([1.03...1.1], duration: 0), "if(lt(t,1.03),0,if(lte(t,1.1),1,0))")
+        XCTAssertEqual(AudioBleep.insideExpression([], duration: 5), "0")
+
+        // "Entire audio" for several files: an infinite end covers each file to its own end.
+        let whole = [BleepRange(start: 0, end: .infinity)]
+        XCTAssertEqual(AudioBleep.merged(whole, duration: 220), [0...220])
+        XCTAssertEqual(AudioBleep.merged(whole, duration: 180), [0...180])
+        XCTAssertEqual(AudioBleep.insideExpression(AudioBleep.merged(whole, duration: 0), duration: 0), "if(lt(t,0),0,1)")
 
         let info = AudioInfo(duration: 10, channels: 2, channelLayout: "stereo", sampleRate: 48000, codec: "aac")
         let beep = try AudioBleep.filterGraph(settings: BleepSettings(ranges: ranges, style: .beep, volume: 0.25), info: info)
-        XCTAssertTrue(beep.contains("volume=0:enable='between(t,1,2.5)+between(t,3,4)+between(t,9,10)'"))
-        XCTAssertTrue(beep.contains("sine=frequency=1000:sample_rate=48000"))
-        XCTAssertTrue(beep.contains("volume=2,"), "0.25 of full scale = 2 × sine's 1/8 amplitude")
-        XCTAssertTrue(beep.contains("pan=stereo|c0=c0|c1=c0"))
-        XCTAssertTrue(beep.hasSuffix("amix=inputs=2:duration=first:dropout_transition=0:normalize=0[bleeped]"))
+        XCTAssertEqual(beep, "[0:0]asetpts=PTS-STARTPTS,aeval=exprs='if("
+                       + AudioBleep.insideExpression(merged, duration: 10)
+                       + ",0.25*sin(2*PI*1000*t),val(ch))':c=same[bleeped]")
+        XCTAssertFalse(beep.contains("enable="), "timeline enable is only checked once per frame")
         let silence = try AudioBleep.filterGraph(settings: BleepSettings(ranges: ranges, style: .silence), info: info)
-        XCTAssertFalse(silence.contains("sine"))
+        XCTAssertFalse(silence.contains("sin("))
+        XCTAssertTrue(silence.contains(",0,val(ch))'"))
         XCTAssertTrue(silence.hasSuffix("[bleeped]"))
         XCTAssertThrowsError(try AudioBleep.filterGraph(settings: BleepSettings(), info: info))
     }
@@ -233,7 +280,67 @@ final class AudioParsingTests: XCTestCase {
         XCTAssertEqual(movie.codecArguments.prefix(2), ["-c:a", "aac"])
         XCTAssertFalse(movie.carriesCoverArt)
         XCTAssertEqual(AudioEncoding.preview(forDuration: 60), .previewWAV)
+
+        // The container must be able to hold the codec.
+        func enc(_ codec: String, _ ext: String, video: Bool = false, bitRate: Int? = nil) -> AudioEncoding {
+            AudioEncoding.matching(AudioInfo(duration: 1, channels: 2, sampleRate: 44100, codec: codec, bitRate: bitRate,
+                                             hasVideo: video), source: url(ext))
+        }
+        XCTAssertEqual(enc("pcm_mulaw", "au").codecArguments, ["-c:a", "pcm_mulaw"])
+        XCTAssertEqual(enc("pcm_mulaw", "au").fileExtension, "au")
+        XCTAssertEqual(enc("mp2", "mp2").codecArguments, ["-c:a", "mp2", "-b:a", "192k"])
+        XCTAssertEqual(enc("mp2", "mpg", video: true, bitRate: 384_000).codecArguments, ["-c:a", "mp2", "-b:a", "384k"])
+        XCTAssertEqual(enc("aac", "m4r").codecArguments, ["-c:a", "aac", "-b:a", "192k", "-f", "ipod"])
+        XCTAssertEqual(enc("aac", "m4r").fileExtension, "m4r")
+        XCTAssertEqual(enc("wavpack", "wv").codecArguments, ["-c:a", "wavpack"])
+        XCTAssertEqual(enc("aac", "caf").codecArguments, ["-c:a", "alac"], "ffmpeg can't write AAC into CAF")
+        let amr = enc("amr_nb", "amr")
+        XCTAssertEqual(amr.fileExtension, "m4a", "no AMR encoder: M4A instead")
+        XCTAssertEqual(amr.codecArguments.prefix(2), ["-c:a", "aac"])
+        XCTAssertTrue(amr.carriesCoverArt)
+        XCTAssertEqual(enc("dts", "dts").fileExtension, "m4a")
+        XCTAssertEqual(enc("ape", "ape").fileExtension, "flac", "lossless stays lossless")
+        XCTAssertEqual(enc("ape", "ape").codecArguments, ["-c:a", "flac"])
+        XCTAssertEqual(enc("alac", "").fileExtension, "m4a")
+        XCTAssertEqual(enc("alac", "").codecArguments, ["-c:a", "alac"])
+        XCTAssertEqual(enc("dts", "mkv", video: true).codecArguments.prefix(2), ["-c:a", "aac"])
+        XCTAssertEqual(enc("dts", "mkv", video: true).fileExtension, "mkv")
+        XCTAssertEqual(enc("aac", "xyz", video: true).fileExtension, "mkv")
+        XCTAssertEqual(enc("pcm_s16le", "aiff").codecArguments, ["-c:a", "pcm_s16le"])
+        XCTAssertEqual(enc("pcm_s24le", "flac").codecArguments, ["-c:a", "flac"])
+        XCTAssertEqual(enc("pcm_s16be", "wav").codecArguments, ["-c:a", "pcm_s16le"], "WAV has no big-endian PCM")
+        XCTAssertEqual(enc("wmav2", "wma").codecArguments.prefix(2), ["-c:a", "aac"])
+        // Every audio extension FileKind accepts, with its usual codec, gets a codec its container holds.
+        let usual = ["mp3": "mp3", "m4a": "aac", "m4b": "aac", "m4r": "aac", "aac": "aac", "wav": "pcm_s16le",
+                     "aif": "pcm_s16be", "aiff": "pcm_s16be", "aifc": "pcm_s16be", "caf": "aac", "flac": "flac",
+                     "ogg": "vorbis", "oga": "vorbis", "opus": "opus", "wma": "wmav2", "amr": "amr_nb", "au": "pcm_mulaw",
+                     "snd": "pcm_mulaw", "mp2": "mp2", "ac3": "ac3", "3gp": "aac", "mka": "aac", "ape": "ape", "wv": "wavpack"]
+        for (ext, codec) in usual {
+            let e = enc(codec, ext)
+            let produced = e.codecArguments[1] == "libmp3lame" ? "mp3" : e.codecArguments[1] == "libopus" ? "opus" : e.codecArguments[1]
+            XCTAssertTrue(AudioEncoding.holds(e.fileExtension, produced), "\(ext) \(codec) -> \(e)")
+        }
         XCTAssertEqual(AudioEncoding.preview(forDuration: 3600), .previewAAC)
+    }
+
+    func testStreamArgumentsKeepEveryOtherStreamOfMovies() {
+        let movie = AudioInfo(duration: 5, channels: 2, sampleRate: 48000, codec: "aac", audioStreamIndex: 1,
+                              otherAudioStreamIndices: [3], hasVideo: true)
+        let enc = AudioEncoding(codecArguments: ["-c:a", "aac", "-b:a", "192k"], fileExtension: "mp4")
+        XCTAssertEqual(AudioFFmpeg.audioArguments(movie, encoding: enc, keepVideo: true, filter: "pan=mono|c0=c0", sampleRate: 48000),
+                       ["-map", "0:v?", "-map", "0:1", "-map", "0:3", "-map", "0:s?", "-map", "0:t?", "-c", "copy",
+                        "-filter:a:0", "pan=mono|c0=c0", "-c:a:0", "aac", "-b:a:0", "192k", "-ar:a:0", "48000"])
+        // Without the video (previews) only the processed track is written.
+        XCTAssertEqual(AudioFFmpeg.audioArguments(movie, encoding: enc, keepVideo: false, filter: "volume=1", sampleRate: nil),
+                       ["-vn", "-map", "0:1", "-af", "volume=1", "-c:a", "aac", "-b:a", "192k"])
+    }
+
+    func testBackgroundImageSize() {
+        XCTAssertEqual(AudioVisualizer.backgroundShortSide, 1920)
+        XCTAssertEqual(AudioVisualizer.backgroundMaxPixelSize(width: 8064, height: 6048), 2560, "48 MP -> short side 1920")
+        XCTAssertEqual(AudioVisualizer.backgroundMaxPixelSize(width: 3000, height: 4000), 2560)
+        XCTAssertEqual(AudioVisualizer.backgroundMaxPixelSize(width: 1000, height: 800), 1000, "small images keep their size")
+        XCTAssertEqual(AudioVisualizer.backgroundMaxPixelSize(width: 7680, height: 1920), 7680, "a panorama keeps enough height")
     }
 
     func testVisualizerGraphs() {
@@ -514,6 +621,165 @@ final class AudioToolsIntegrationTests: XCTestCase {
         let wholeInfo = try await AudioProbe.probe(whole)
         let mp3Info = try await AudioProbe.probe(mp3)
         XCTAssertEqual(wholeInfo.duration, mp3Info.duration, accuracy: 0.06)
+    }
+
+    /// Mono float samples of a file at 44.1 kHz.
+    func samples(_ url: URL) async throws -> [Float] {
+        let raw = dir.appendingPathComponent("samples-\(UUID().uuidString).raw")
+        try await ffmpeg(["-i", url.path, "-ac", "1", "-ar", "44100", "-f", "f32le", "-c:a", "pcm_f32le", raw.path])
+        let data = try Data(contentsOf: raw)
+        return data.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+    }
+
+    func peak(_ s: [Float], from: Double, to: Double, rate: Double = 44100) -> Float {
+        s[Int((from * rate).rounded())...Int((to * rate).rounded())].map(abs).max() ?? 0
+    }
+
+    func testBleepIsSampleAccurate() async throws {
+        // WAV decodes in 4096-sample packets (93 ms): neither range starts on a packet boundary, and
+        // 1.03–1.10 s lies inside a single packet.
+        let src = dir.appendingPathComponent("word.wav")
+        try await ffmpeg(["-f", "lavfi", "-i", "sine=f=440:r=44100:d=2", "-af", "volume=4", src.path])
+        let original = try await samples(src)
+
+        let output = dir.appendingPathComponent("muted.wav")
+        try await AudioBleep.bleep(src, settings: BleepSettings(ranges: [BleepRange(start: 1.03, end: 1.10)], style: .silence),
+                                   output: output)
+        let muted = try await samples(output)
+        XCTAssertLessThan(peak(muted, from: 1.0302, to: 1.0998), 0.0001, "silent from the first sample of the range")
+        XCTAssertGreaterThan(peak(muted, from: 1.0, to: 1.0298), 0.45, "untouched just before")
+        XCTAssertGreaterThan(peak(muted, from: 1.1002, to: 1.13), 0.45, "untouched just after")
+
+        let beepURL = dir.appendingPathComponent("beeped.wav")
+        try await AudioBleep.bleep(src, settings: BleepSettings(ranges: [BleepRange(start: 0.94, end: 1.2)], style: .beep,
+                                                                volume: 0.3, frequency: 1000), output: beepURL)
+        let beeped = try await samples(beepURL)
+        XCTAssertEqual(beeped.count, original.count)
+        var toneError: Float = 0
+        for i in Int(0.9402 * 44100)...Int(1.1998 * 44100) {
+            toneError = max(toneError, abs(beeped[i] - Float(0.3 * sin(2 * Double.pi * 1000 * Double(i) / 44100))))
+        }
+        XCTAssertLessThan(toneError, 0.002, "only the tone inside the range, none of the word")
+        var sourceError: Float = 0
+        for i in Int(1.2002 * 44100)...Int(1.3 * 44100) { sourceError = max(sourceError, abs(beeped[i] - original[i])) }
+        for i in Int(0.85 * 44100)...Int(0.9398 * 44100) { sourceError = max(sourceError, abs(beeped[i] - original[i])) }
+        XCTAssertLessThan(sourceError, 0.001, "the audio around the range is unchanged, with no tone")
+    }
+
+    func testEstimatedDurationIsMeasuredAndEmptyResultsFail() async throws {
+        // Raw ADTS AAC with a quiet start: ffprobe estimates its length from the bit rate, far too long.
+        let aac = dir.appendingPathComponent("vbr.aac")
+        try await ffmpeg(["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo:d=3", "-f", "lavfi", "-i", "anoisesrc=d=3:a=0.3:r=44100",
+                          "-filter_complex", "[1]pan=stereo|c0=c0|c1=c0[n];[0][n]concat=n=2:v=0:a=1", "-c:a", "aac", "-q:a", "2", aac.path])
+        let info = try await AudioProbe.probe(aac)
+        XCTAssertEqual(info.duration, 6, accuracy: 0.1)
+        XCTAssertNotNil(info.bitRate)
+
+        let wave = try await WaveformExtractor.extract(aac, buckets: 60, info: info)
+        XCTAssertLessThan(wave.channels[0][0..<28].max()!, 0.01, "the quiet half is drawn in the first half")
+        XCTAssertGreaterThan(wave.channels[0][32..<60].min()!, 0.1, "the loud half fills the second half")
+
+        // A range past the real end: ffmpeg exits cleanly but writes nothing. That's an error, not an export.
+        var stale = info
+        stale.duration = 100
+        let output = dir.appendingPathComponent("vbr trimmed.aac")
+        do {
+            try await AudioTrim.trim(aac, settings: TrimSettings(start: 50, end: 60), info: stale, output: output)
+            XCTFail("an empty result must not count as a success")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("empty"), error.localizedDescription)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func testExportsWriteCodecsTheirContainersHold() async throws {
+        let wav = try await makeStereo(seconds: 1)
+        let fixtures: [(String, [String])] = [
+            ("t.au", ["-c:a", "pcm_mulaw"]), ("t.mp2", ["-c:a", "mp2"]), ("t.m4r", ["-c:a", "aac", "-f", "ipod"]),
+            ("t.wv", ["-c:a", "wavpack"]), ("t.caf", ["-c:a", "alac"]), ("t.aiff", ["-c:a", "pcm_s16be"]),
+            ("t.wma", ["-c:a", "wmav2"]), ("t.oga", ["-c:a", "flac"]),
+        ]
+        for (name, codec) in fixtures {
+            let src = dir.appendingPathComponent(name)
+            try await ffmpeg(["-i", wav.path] + codec + [src.path])
+            let info = try await AudioProbe.probe(src)
+            let ext = src.pathExtension
+            let trimmed = try await AudioTrim.trim(src, settings: TrimSettings(start: 0.2, end: 0.8), info: info)
+            XCTAssertEqual(trimmed.pathExtension, ext, name)
+            let trimmedInfo = try await AudioProbe.probe(trimmed)
+            XCTAssertEqual(trimmedInfo.duration, 0.6, accuracy: 0.1, name)
+            let mono = try await AudioChannels.convert(src, settings: ChannelSettings(output: .mono), info: info)
+            let monoInfo = try await AudioProbe.probe(mono)
+            XCTAssertEqual(monoInfo.channels, 1, name)
+            try await AudioBleep.bleep(src, settings: BleepSettings(ranges: [BleepRange(start: 0.1, end: 0.3)]), info: info)
+        }
+
+        // MPEG-PS video with MP2 audio (.mpg / .vob).
+        let mpg = dir.appendingPathComponent("v.mpg")
+        try await ffmpeg(["-f", "lavfi", "-i", "testsrc=size=160x120:rate=25", "-f", "lavfi", "-i", "sine=f=440:d=1",
+                          "-t", "1", "-c:v", "mpeg2video", "-c:a", "mp2", "-ac", "2", mpg.path])
+        let mono = try await AudioChannels.convert(mpg, settings: ChannelSettings(output: .mono))
+        XCTAssertEqual(mono.pathExtension, "mpg")
+        let s = try await streams(mono)
+        XCTAssertEqual(s.first { $0["codec_type"] as? String == "video" }?["codec_name"] as? String, "mpeg2video")
+        XCTAssertEqual(s.first { $0["codec_type"] as? String == "audio" }?["channels"] as? Int, 1)
+        let normalized = try await AudioNormalize.normalize(mpg, target: LoudnessPreset.streaming.target!)
+        XCTAssertEqual(normalized.pathExtension, "mpg")
+    }
+
+    func testMoviesKeepOtherAudioTracksAndSubtitles() async throws {
+        let srt = dir.appendingPathComponent("subs.srt")
+        try "1\n00:00:00,000 --> 00:00:01,500\nHello\n".write(to: srt, atomically: true, encoding: .utf8)
+        let movie = dir.appendingPathComponent("multi.mp4")
+        try await ffmpeg(["-f", "lavfi", "-i", "testsrc=size=160x120:rate=10", "-f", "lavfi", "-i", "sine=f=440:d=2",
+                          "-f", "lavfi", "-i", "sine=f=660:d=2", "-i", srt.path,
+                          "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:s", "-t", "2",
+                          "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-ac", "2", "-c:s", "mov_text",
+                          "-metadata:s:a:0", "language=eng", "-metadata:s:a:1", "language=ger", movie.path])
+        let info = try await AudioProbe.probe(movie)
+        XCTAssertEqual(info.otherAudioStreamIndices.count, 1)
+
+        func check(_ url: URL, firstChannels: Int) async throws {
+            let s = try await streams(url)
+            let types = s.compactMap { $0["codec_type"] as? String }
+            XCTAssertEqual(types, ["video", "audio", "audio", "subtitle"], url.lastPathComponent)
+            let audio = s.filter { $0["codec_type"] as? String == "audio" }
+            XCTAssertEqual(audio.first?["channels"] as? Int, firstChannels)
+            XCTAssertEqual(audio.last?["channels"] as? Int, 2, "the second track is copied as it is")
+            XCTAssertEqual((audio.last?["tags"] as? [String: Any])?["language"] as? String, "ger")
+            XCTAssertEqual(s.last?["codec_name"] as? String, "mov_text")
+        }
+        let mono = try await AudioChannels.convert(movie, settings: ChannelSettings(output: .mono), info: info)
+        try await check(mono, firstChannels: 1)
+        let normalized = try await AudioNormalize.normalize(movie, target: LoudnessPreset.podcast.target!, info: info)
+        try await check(normalized, firstChannels: 2)
+    }
+
+    func testCancellingARenderStopsFFmpeg() async throws {
+        let output = dir.appendingPathComponent("long.wav")
+        // -re: realtime, so this would take a minute if it weren't stopped.
+        let args = AudioFFmpeg.baseArguments + ["-re", "-f", "lavfi", "-i", "sine=f=440:d=60", "-c:a", "pcm_s16le", output.path]
+        let started = Date()
+        let task = Task { try await AudioFFmpeg.run(args, output: output) }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        task.cancel()
+        do {
+            try await task.value
+            XCTFail("cancelled")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 10)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path), "the partial render is deleted")
+    }
+
+    func testLargeBackgroundImageIsDownscaled() async throws {
+        let big = dir.appendingPathComponent("big.png")
+        try await ffmpeg(["-f", "lavfi", "-i", "testsrc=size=4000x3000", "-frames:v", "1", big.path])
+        let prepared = try AudioVisualizer.preparedImage(big, into: dir)
+        let s = try await streams(prepared)
+        XCTAssertEqual(s.first?["width"] as? Int, 2560)
+        XCTAssertEqual(s.first?["height"] as? Int, 1920)
     }
 
     func testVisualizerStylesProduceVideo() async throws {

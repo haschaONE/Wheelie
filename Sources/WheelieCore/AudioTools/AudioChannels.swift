@@ -92,10 +92,9 @@ public enum AudioChannels {
     public static func arguments(input: URL, output: URL, info: AudioInfo, settings: ChannelSettings,
                                  encoding: AudioEncoding, keepVideo: Bool = true) -> [String] {
         var args = AudioFFmpeg.baseArguments + ["-i", input.path]
-        args += AudioFFmpeg.streamMaps(info, encoding: encoding, keepVideo: keepVideo)
-        args += ["-af", filter(info: info, settings: settings)]
-        args += encoding.codecArguments
-        if let rate = encoding.requiredSampleRate { args += ["-ar", "\(rate)"] }
+        args += AudioFFmpeg.audioArguments(info, encoding: encoding, keepVideo: keepVideo,
+                                           filter: filter(info: info, settings: settings),
+                                           sampleRate: encoding.requiredSampleRate)
         if info.hasVideo && keepVideo && isMP4Family(output) { args += ["-movflags", "+faststart"] }
         args.append(output.path)
         return args

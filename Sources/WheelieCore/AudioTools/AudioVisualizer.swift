@@ -243,21 +243,48 @@ public enum AudioVisualizer {
         return output
     }
 
-    /// Re-encodes any image ImageIO can read (HEIC, WebP, ...) as PNG so ffmpeg can use it.
+    /// Shortest side a background image needs: it is scaled to cover the canvas, so its short side never
+    /// has to exceed the largest canvas dimension.
+    public static let backgroundShortSide = VisualizerCanvas.presets.map { max($0.width, $0.height) }.max() ?? 1920
+
+    /// Longest side to scale an image of this size to so its short side is at most `shortSide`
+    /// (never larger than the image).
+    static func backgroundMaxPixelSize(width: Int, height: Int, shortSide: Int = backgroundShortSide) -> Int {
+        let short = max(1, min(width, height)), long = max(width, height)
+        guard short > shortSide else { return long }
+        return Int((Double(long) * Double(shortSide) / Double(short)).rounded(.up))
+    }
+
+    /// Re-encodes any image ImageIO can read (HEIC, WebP, ...) as PNG so ffmpeg can use it, downscaled so
+    /// its short side is no more than the largest canvas needs. ffmpeg decodes and scales the looped image
+    /// for every video frame, so a 48 MP photo would make exports many times slower. Slow for big images:
+    /// call it off the main thread.
     public static func preparedImage(_ url: URL, into directory: URL) throws -> URL {
-        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            throw AudioToolError.unreadable("Could not read the image.")
+        }
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        var width = properties?[kCGImagePropertyPixelWidth] as? Int ?? 0
+        var height = properties?[kCGImagePropertyPixelHeight] as? Int ?? 0
+        if width <= 0 || height <= 0 {
+            guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+                throw AudioToolError.unreadable("Could not read the image.")
+            }
+            width = image.width
+            height = image.height
+        }
+        // Honour EXIF orientation.
+        let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
+                                        kCGImageSourceCreateThumbnailWithTransform: true,
+                                        kCGImageSourceThumbnailMaxPixelSize: backgroundMaxPixelSize(width: width, height: height)]
+        guard let oriented = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+                ?? CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw AudioToolError.unreadable("Could not read the image.")
         }
         let output = directory.appendingPathComponent("background-\(UUID().uuidString).png")
         guard let dest = CGImageDestinationCreateWithURL(output as CFURL, UTType.png.identifier as CFString, 1, nil) else {
             throw AudioToolError.unreadable("Could not read the image.")
         }
-        // Honour EXIF orientation.
-        let options: [CFString: Any] = [kCGImageSourceCreateThumbnailFromImageAlways: true,
-                                        kCGImageSourceCreateThumbnailWithTransform: true,
-                                        kCGImageSourceThumbnailMaxPixelSize: max(image.width, image.height)]
-        let oriented = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) ?? image
         CGImageDestinationAddImage(dest, oriented, nil)
         guard CGImageDestinationFinalize(dest) else { throw AudioToolError.unreadable("Could not read the image.") }
         return output

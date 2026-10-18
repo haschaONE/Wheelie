@@ -165,11 +165,10 @@ public enum AudioNormalize {
                                  measurement: LoudnessMeasurement, encoding: AudioEncoding,
                                  keepVideo: Bool = true) -> [String] {
         var args = AudioFFmpeg.baseArguments + ["-i", input.path]
-        args += AudioFFmpeg.streamMaps(info, encoding: encoding, keepVideo: keepVideo)
-        args += ["-af", applyFilter(target: target, measurement: measurement)]
-        args += encoding.codecArguments
         // loudnorm works at 192 kHz; go back to the source rate.
-        args += ["-ar", "\(encoding.outputSampleRate(for: info))"]
+        args += AudioFFmpeg.audioArguments(info, encoding: encoding, keepVideo: keepVideo,
+                                           filter: applyFilter(target: target, measurement: measurement),
+                                           sampleRate: encoding.outputSampleRate(for: info))
         if info.hasVideo && keepVideo && AudioChannels.isMP4Family(output) { args += ["-movflags", "+faststart"] }
         args.append(output.path)
         return args
